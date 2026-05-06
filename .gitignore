@@ -1,0 +1,12 @@
+# Ignorar archivos masivos
+wiki_es.txt
+*.txt
+!requierements.txt
+
+# Ignorar archivos de entorno
+.env
+__pycache__/
+*.pyc
+
+# Ignorar logs
+*_logs.txt

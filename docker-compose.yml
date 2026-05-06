@@ -1,0 +1,55 @@
+# docker-compose.yml — Orquestación del Ambassador y un worker local para pruebas.
+#
+# Topología completa del proyecto:
+#   - Esta laptop:      Ambassador (:5000)
+#   - Laptops remotas:  3× Workers (:5001) — cada una hace docker run por separado
+#
+# Para el día de la demo:
+#   1. Copiar .env.example → .env y actualizar IPs.
+#   2. Ejecutar: docker-compose up --build
+#   3. En cada laptop de worker: docker run (ver CLAUDE.md)
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Ambassador — intermediario entre Coordinator y Workers
+  # ---------------------------------------------------------------------------
+  ambassador:
+    build:
+      context: .
+      dockerfile: Dockerfile.ambassador
+    ports:
+      - "5005:5005"          # Expone el Ambassador a la red local
+    env_file:
+      - .env                 # IPs de los workers (WORKER_1_URL, WORKER_2_URL, ...)
+    restart: on-failure      # Reiniciar automáticamente si el proceso muere
+
+  # ---------------------------------------------------------------------------
+  # Worker local — para pruebas en una sola laptop sin red real
+  # ---------------------------------------------------------------------------
+  # Para usarlo en la demo real, elimina este servicio y usa las laptops remotas.
+  worker_local:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    ports:
+      - "5001:5001"
+    environment:
+      WORKER_ID: "worker_local"
+    volumes:
+      # Bind mount del archivo de 5GB — el archivo NO entra a la imagen Docker.
+      # Usamos ./wiki_es.txt ya que el archivo se encuentra en el mismo directorio
+      - ./wiki_es.txt:/app/wiki_es.txt:ro
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Coordinator — placeholder (pendiente del compañero)
+  # ---------------------------------------------------------------------------
+  # coordinator:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.coordinator
+  #   ports:
+  #     - "4999:4999"
+  #   depends_on:
+  #     - ambassador
