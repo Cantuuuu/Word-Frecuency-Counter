@@ -34,11 +34,11 @@ def count_words():
     text = data.get("text", "")
 
     words = re.findall(r"\b\w+\b", text.lower())
-    word_count = Counter(words)
+    result = Counter(words)
 
     return jsonify({
         "worker_id": WORKER_ID,
-        "result": dict(word_count)
+        "result": dict(result)
     })
 
 
