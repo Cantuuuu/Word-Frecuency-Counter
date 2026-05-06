@@ -7,6 +7,9 @@ import time
 app = Flask(__name__)
 
 WORKER_ID = os.getenv("WORKER_ID", "worker_1")
+PORT = int(os.getenv("PORT", "5001"))
+FILE_PATH = os.getenv("FILE_PATH", "/app/data/input.txt")
+
 DELAY = float(os.getenv("DELAY", "0"))
 FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 
@@ -15,8 +18,24 @@ FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 def health():
     return jsonify({
         "worker_id": WORKER_ID,
-        "status": "ok"
+        "status": "ok",
+        "file_path": FILE_PATH
     })
+
+
+def count_words_from_file(file_path, start, end):
+    counter = Counter()
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+        file.seek(start)
+
+        size = end - start
+        chunk = file.read(size)
+
+        words = re.findall(r"\b\w+\b", chunk.lower())
+        counter.update(words)
+
+    return counter
 
 
 @app.route("/count", methods=["POST"])
@@ -31,17 +50,19 @@ def count_words():
         time.sleep(DELAY)
 
     data = request.get_json()
-    text = data.get("text", "")
 
-    words = re.findall(r"\b\w+\b", text.lower())
-    result = Counter(words)
+    start = int(data.get("start", 0))
+    end = int(data.get("end", 0))
+
+    result = count_words_from_file(FILE_PATH, start, end)
 
     return jsonify({
         "worker_id": WORKER_ID,
+        "start": start,
+        "end": end,
         "result": dict(result)
     })
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5001"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
