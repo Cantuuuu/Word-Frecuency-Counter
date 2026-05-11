@@ -39,13 +39,17 @@ RESET_TIMEOUT = 10   # Segundos en OPEN antes de pasar a HALF_OPEN
 # Política de reintentos
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES = 3   # Intentos totales: 1 original + 2 reintentos
+MAX_RETRIES = 1   # 1 = sin reintentos. Con chunks de ~1.7 GB, un fallo es timeout
+                  # genuino o worker caído; reintentar sobre el mismo archivo
+                  # solo multiplica el tiempo de espera sin recuperar datos.
 
 # ---------------------------------------------------------------------------
 # Timeout de red
 # ---------------------------------------------------------------------------
 
-REQUEST_TIMEOUT = 20   # Segundos máximos de espera por respuesta de un worker
+REQUEST_TIMEOUT = 600  # 10 minutos — necesario para chunks de ~1.7 GB sobre
+                       # disco local en Docker. Ajustar si los workers son más
+                       # lentos (ej. HDD, red WiFi saturada).
 
 # ---------------------------------------------------------------------------
 # Archivo de texto

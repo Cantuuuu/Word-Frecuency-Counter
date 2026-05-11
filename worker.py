@@ -23,17 +23,38 @@ def health():
     })
 
 
+BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB por bloque — evita OOM con chunks de varios GB
+
+
 def count_words_from_file(file_path, start, end):
+    """
+    Cuenta palabras en el rango de bytes [start, end) del archivo.
+
+    Lee en bloques de BUFFER_SIZE en vez de cargar el chunk completo en memoria.
+    Esto permite procesar chunks de varios GB con uso de RAM acotado (~64 MB por hilo).
+
+    Parámetros:
+        file_path (str): Ruta al archivo de texto.
+        start     (int): Byte de inicio (inclusivo).
+        end       (int): Byte de fin (exclusivo).
+
+    Retorna:
+        Counter: Frecuencia de cada palabra en el rango dado.
+    """
     counter = Counter()
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
         file.seek(start)
+        remaining = end - start
 
-        size = end - start
-        chunk = file.read(size)
-
-        words = re.findall(r"\b\w+\b", chunk.lower())
-        counter.update(words)
+        while remaining > 0:
+            to_read = min(BUFFER_SIZE, remaining)
+            chunk = file.read(to_read)
+            if not chunk:
+                break
+            words = re.findall(r"\b\w+\b", chunk.lower())
+            counter.update(words)
+            remaining -= len(chunk.encode("utf-8", errors="ignore"))
 
     return counter
 

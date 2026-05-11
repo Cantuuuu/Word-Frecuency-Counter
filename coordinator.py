@@ -25,7 +25,7 @@ FILE_PATH      = os.getenv("FILE_PATH",      "/app/wiki_es.txt")
 AMBASSADOR_URL = os.getenv("AMBASSADOR_URL", "http://localhost:5005")
 NUM_CHUNKS     = int(os.getenv("NUM_CHUNKS", "3"))
 
-REQUEST_TIMEOUT = 30  # segundos por chunk
+REQUEST_TIMEOUT = 600  # segundos por chunk
 
 
 # ---------------------------------------------------------------------------

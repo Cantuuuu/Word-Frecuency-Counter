@@ -151,9 +151,14 @@ def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
       - HTTP status_code != 200           → error del servidor
       - JSON con "status": "error"        → error lógico reportado por el worker
 
+    Nota de traducción de contrato:
+        El Coordinator envía {chunk_id, inicio, fin} al Ambassador.
+        El Worker espera {start, end}. Esta función traduce el payload
+        antes de reenviar, manteniendo ambas interfaces sin modificarlas.
+
     Parámetros:
         worker_id (str) : ID del worker destino (ej. "worker_1").
-        payload   (dict): Cuerpo JSON a enviar: {chunk_id, inicio, fin}.
+        payload   (dict): Cuerpo JSON recibido del Coordinator: {chunk_id, inicio, fin}.
 
     Retorna:
         dict: El campo "result" del JSON de respuesta del worker.
@@ -164,10 +169,12 @@ def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
     url = f"{config.WORKERS[worker_id]}/count"
     cb  = circuit_breakers[worker_id]
 
+    worker_payload = {"start": payload["inicio"], "end": payload["fin"]}
+
     try:
         respuesta = requests.post(
             url,
-            json=payload,
+            json=worker_payload,
             timeout=config.REQUEST_TIMEOUT,
         )
     except requests.exceptions.Timeout:

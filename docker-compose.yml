@@ -39,7 +39,7 @@ services:
     volumes:
       # Bind mount del archivo de 5GB — el archivo NO entra a la imagen Docker.
       # Usamos ./wiki_es.txt ya que el archivo se encuentra en el mismo directorio
-      - ./wiki_es.txt:/app/wiki_es.txt:ro
+      - ./wiki_es.txt:/app/data/input.txt:ro
     restart: on-failure
 
   # ---------------------------------------------------------------------------
