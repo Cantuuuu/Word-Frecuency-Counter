@@ -43,13 +43,19 @@ services:
     restart: on-failure
 
   # ---------------------------------------------------------------------------
-  # Coordinator — placeholder (pendiente del compañero)
+  # Coordinator — divide el archivo y despacha chunks al Ambassador
   # ---------------------------------------------------------------------------
-  # coordinator:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.coordinator
-  #   ports:
-  #     - "4999:4999"
-  #   depends_on:
-  #     - ambassador
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    ports:
+      - "4999:4999"
+    environment:
+      AMBASSADOR_URL: "http://ambassador:5005"
+      FILE_PATH: "/app/wiki_es.txt"
+      NUM_CHUNKS: "3"
+    volumes:
+      - ./wiki_es.txt:/app/wiki_es.txt:ro
+    depends_on:
+      - ambassador
