@@ -48,6 +48,7 @@ services:
   # benchmark y termina. Por eso no tiene restart ni puertos expuestos.
   # ---------------------------------------------------------------------------
   coordinator:
+    profiles: [coordinator]
     build:
       context: .
       dockerfile: Dockerfile.coordinator
