@@ -393,10 +393,15 @@ def _health_poller() -> None:
             try:
                 r = requests.get(f"{url}/health", timeout=2)
                 if r.status_code == 200:
-                    cb.record_success()
+                    # allow_request() activa OPEN→HALF_OPEN si el timeout expiró.
+                    # Sin esta llamada, un CB en OPEN nunca transiciona desde el poller.
+                    if cb.allow_request():
+                        cb.record_success()   # HALF_OPEN→CLOSED  o  CLOSED reset fail_count
                 else:
                     cb.record_failure()
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            except Exception:
+                # Captura Timeout, ConnectionError y cualquier otro error inesperado
+                # para que el hilo daemon no muera silenciosamente.
                 cb.record_failure()
 
             # Loguear solo si el estado cambió (evita ruido en consola durante el demo)
