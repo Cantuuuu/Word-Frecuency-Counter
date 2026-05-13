@@ -267,21 +267,23 @@ def dispatch():
             }), 503
 
         cb = circuit_breakers[worker_id]
+        # Capturar el estado ANTES del call: record_success() ya habrá
+        # transicionado a CLOSED cuando leamos cb.state después.
+        era_half_open = cb.state.value == "HALF_OPEN"
         _log(f"Worker seleccionado : {worker_id}")
         _log(f"Estado CB {worker_id:<12}: {cb.state.value} {'🟢' if cb.state.value == 'CLOSED' else '🟡' if cb.state.value == 'HALF_OPEN' else '🔴'}")
         _log(f"Intento             : {intento} / {config.MAX_RETRIES}")
 
         try:
-            import time as _time
-            t_inicio  = _time.monotonic()
+            t_inicio  = time.monotonic()
             resultado = _despachar_a_worker(worker_id, payload)
-            t_fin     = _time.monotonic()
+            t_fin     = time.monotonic()
 
             _log(f"Tiempo de respuesta : {t_fin - t_inicio:.3f}s")
             _log(f"Resultado           : OK ✓")
 
-            # Verificar si el CB acababa de recuperarse (transición HALF_OPEN → CLOSED)
-            if cb.state.value == "CLOSED" and worker_id in ya_fallaron:
+            # Detectar transición HALF_OPEN → CLOSED (prueba exitosa de recuperación)
+            if era_half_open:
                 _log(f"Prueba exitosa      : CB {worker_id} → CLOSED 🟢")
 
             return jsonify({
