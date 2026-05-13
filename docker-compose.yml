@@ -49,7 +49,6 @@ services:
     environment:
       AMBASSADOR_URL: "http://ambassador:5005"
       FILE_PATH:      "/app/wiki_es.txt"
-      MIN_WORKERS:    "1"
     volumes:
       - ./wiki_es.txt:/app/wiki_es.txt:ro
     depends_on:
