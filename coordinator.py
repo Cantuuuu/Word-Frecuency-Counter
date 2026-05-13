@@ -65,11 +65,12 @@ def calcular_chunks(file_path: str, n: int) -> list[tuple[int, int]]:
         end   = start + size if i < n - 1 else total
         chunks.append((start, end))
 
-    # Verificar cobertura exacta del archivo
-    assert chunks[0][0] == 0,     "El primer chunk debe comenzar en 0"
-    assert chunks[-1][1] == total, "El último chunk debe terminar en el byte final"
+    # Verificar cobertura exacta del archivo — assert se elimina con -O, usar raise
+    if chunks[0][0] != 0 or chunks[-1][1] != total:
+        raise ValueError("Los chunks no cubren el archivo completo")
     for i in range(len(chunks) - 1):
-        assert chunks[i][1] == chunks[i + 1][0], f"Brecha entre chunk {i} y {i+1}"
+        if chunks[i][1] != chunks[i + 1][0]:
+            raise ValueError(f"Brecha entre chunk {i} y {i+1}")
 
     _log(f"Archivo: {total:,} bytes → {n} chunks de ~{size:,} bytes c/u")
     return chunks
@@ -99,7 +100,7 @@ def _enviar_chunk(chunk_id: int, inicio: int, fin: int) -> dict:
 # PASO 4 — Combinar resultados
 # ---------------------------------------------------------------------------
 
-def distribuido(file_path: str, ambassador_url: str, num_chunks: int) -> Counter:
+def distribuido(file_path: str, num_chunks: int) -> tuple[Counter, float]:
     chunks = calcular_chunks(file_path, num_chunks)
 
     t_inicio = time.monotonic()
@@ -139,6 +140,10 @@ def distribuido(file_path: str, ambassador_url: str, num_chunks: int) -> Counter
     for palabra, cnt in total_counter.most_common(20):
         _log(f"  {palabra:<20} {cnt:>10,}")
 
+    if exitosos < num_chunks:
+        _log(f"ADVERTENCIA: {num_chunks - exitosos} chunk(s) fallaron — resultado parcial")
+        raise SystemExit(1)
+
     return total_counter, elapsed
 
 
@@ -146,13 +151,17 @@ def distribuido(file_path: str, ambassador_url: str, num_chunks: int) -> Counter
 # PASO 6 — Ground truth secuencial
 # ---------------------------------------------------------------------------
 
+PATRON_PALABRAS = re.compile(r"\b[a-záéíóúüñ]+\b")
+
+
 def sequential_count(file_path: str) -> tuple[Counter, float]:
     _log("Iniciando conteo secuencial (ground truth) ...")
     t0 = time.monotonic()
     counter: Counter = Counter()
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+    # errors="replace" igual que en worker.py para que los conteos sean comparables
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            words = re.findall(r"\b\w+\b", line.lower())
+            words = PATRON_PALABRAS.findall(line.lower())
             counter.update(words)
     elapsed = time.monotonic() - t0
     return counter, elapsed
@@ -167,7 +176,7 @@ if __name__ == "__main__":
     health_check()
 
     # PASOS 2-5: distribuido
-    result_dist, t_dist = distribuido(FILE_PATH, AMBASSADOR_URL, NUM_CHUNKS)
+    result_dist, t_dist = distribuido(FILE_PATH, NUM_CHUNKS)
 
     # PASO 6: ground truth secuencial
     result_seq, t_seq = sequential_count(FILE_PATH)
