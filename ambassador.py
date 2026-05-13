@@ -366,6 +366,47 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Health Poller — monitoreo proactivo de workers
+# ---------------------------------------------------------------------------
+
+def _health_poller() -> None:
+    """
+    Hilo de fondo que monitorea el estado de cada worker cada RESET_TIMEOUT segundos.
+
+    Llama a GET /health en cada worker y actualiza su Circuit Breaker:
+      - Respuesta 200      → cb.record_success()  (cierra HALF_OPEN si el worker se recuperó)
+      - Timeout / error    → cb.record_failure()  (puede abrir el CB antes del primer chunk)
+
+    El intervalo es igual a RESET_TIMEOUT para que el poller esté sincronizado
+    con el ciclo de recuperación del CB: cuando el CB pasa a HALF_OPEN, el
+    siguiente poll confirma si el worker ya está sano.
+
+    Solo loguea cuando el estado del CB cambia, para no saturar la consola.
+    Corre como daemon thread: se detiene automáticamente cuando Flask termina.
+    """
+    while True:
+        time.sleep(config.RESET_TIMEOUT)   # esperar primero; al arrancar los workers aún no están listos
+        for worker_id, url in config.WORKERS.items():
+            cb      = circuit_breakers[worker_id]
+            estado_antes = cb.state
+
+            try:
+                r = requests.get(f"{url}/health", timeout=2)
+                if r.status_code == 200:
+                    cb.record_success()
+                else:
+                    cb.record_failure()
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                cb.record_failure()
+
+            # Loguear solo si el estado cambió (evita ruido en consola durante el demo)
+            estado_despues = cb.state
+            if estado_antes != estado_despues:
+                icono = "🟢" if estado_despues.value == "CLOSED" else "🟡" if estado_despues.value == "HALF_OPEN" else "🔴"
+                _log(f"[POLL] CB {worker_id}: {estado_antes.value} → {estado_despues.value} {icono}")
+
+
+# ---------------------------------------------------------------------------
 # Punto de entrada
 # ---------------------------------------------------------------------------
 
