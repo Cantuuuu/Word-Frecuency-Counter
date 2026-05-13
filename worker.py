@@ -51,6 +51,41 @@ FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 # \b = word boundary; [a-záéíóúüñ]+ = solo letras españolas (tildes, ñ, ü incluidos).
 PATRON_PALABRAS = re.compile(r"\b[a-záéíóúüñ]+\b")
 
+# Tamaño de bloque para la lectura del archivo. Leer el chunk completo (1.7 GB)
+# en un solo read() agota la RAM cuando 3 hilos lo hacen en paralelo (~5 GB).
+# Con bloques de 64 MB el pico de RAM por hilo se limita a ~64 MB.
+BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB
+
+
+def _contar_palabras_en_rango(file_path: str, start: int, end: int) -> Counter:
+    """
+    Lee el rango de bytes [start, end) en bloques de BUFFER_SIZE y cuenta palabras.
+
+    Evita OOM al procesar chunks grandes (~1.7 GB) en paralelo: en lugar de
+    cargar el chunk completo en memoria, procesa un bloque de 64 MB a la vez.
+
+    Parámetros:
+        file_path: Ruta al archivo wiki_es.txt.
+        start:     Byte de inicio (inclusivo).
+        end:       Byte de fin (exclusivo).
+
+    Retorna:
+        Counter con la frecuencia de cada palabra en el rango.
+    """
+    counter = Counter()
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        restante = end - start
+        while restante > 0:
+            bloque = f.read(min(BUFFER_SIZE, restante))
+            if not bloque:
+                break
+            restante -= len(bloque)
+            # errors="replace": bytes inválidos → U+FFFD, que el regex no captura
+            texto = bloque.decode("utf-8", errors="replace")
+            counter.update(PATRON_PALABRAS.findall(texto.lower()))
+    return counter
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -128,44 +163,21 @@ def count_words():
             "reason": f"rango inválido: start={start}, end={end}"
         }), 400
 
-    # --- Lectura del fragmento del archivo local ---
+    # --- Conteo por bloques (evita OOM con chunks de ~1.7 GB) ---
     try:
-        # Modo "rb" (binario) en lugar de texto para poder hacer seek() exacto
-        # a un offset de bytes y decodificar manualmente con errors="replace".
-        # En modo texto Python podría ajustar offsets según BOM o fin de línea.
-        with open(WIKI_PATH, "rb") as archivo:
-            # Mover el cursor al byte de inicio del fragmento
-            archivo.seek(start)
-
-            # Leer exactamente (end - start) bytes
-            fragmento_bytes = archivo.read(end - start)
-
+        conteo = _contar_palabras_en_rango(WIKI_PATH, start, end)
     except FileNotFoundError:
         return jsonify({
             "worker_id": WORKER_ID,
             "status": "error",
             "reason": f"archivo no encontrado: {WIKI_PATH}"
         }), 500
-
     except OSError as e:
         return jsonify({
             "worker_id": WORKER_ID,
             "status": "error",
             "reason": f"error al leer el archivo: {str(e)}"
         }), 500
-
-    # --- Decodificación de bytes a texto ---
-    # errors="replace" (no "ignore") evita que un corte en medio de un carácter
-    # UTF-8 multi-byte (ej. vocal con tilde al borde del chunk) lance una excepción.
-    # El byte inválido se reemplaza por U+FFFD ("?"), que el regex no captura
-    # como letra y queda fuera del conteo — comportamiento correcto y seguro.
-    texto = fragmento_bytes.decode("utf-8", errors="replace")
-
-    # --- Conteo de palabras ---
-    # findall devuelve una lista de todas las coincidencias del patrón.
-    # .lower() normaliza para que "La" y "la" cuenten como la misma palabra.
-    palabras = PATRON_PALABRAS.findall(texto.lower())
-    conteo   = Counter(palabras)
 
     return jsonify({
         "worker_id": WORKER_ID,
