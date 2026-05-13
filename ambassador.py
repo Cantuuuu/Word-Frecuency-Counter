@@ -13,7 +13,7 @@ Responsabilidades:
   - Loggear cada evento con el formato exacto requerido para la demo.
   - Exponer el estado de todos los CBs en GET /workers/status.
 
-Puerto: 5000
+Puerto: 5005
 Modo: threaded=True — maneja peticiones del Coordinator en paralelo.
 
 Criterios de fallo (disparan cb.record_failure):
@@ -25,6 +25,7 @@ Criterios de fallo (disparan cb.record_failure):
 
 import itertools
 import threading
+import time
 from datetime import datetime
 
 import requests
