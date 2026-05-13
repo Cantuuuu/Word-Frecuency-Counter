@@ -399,10 +399,13 @@ def _health_poller() -> None:
                         cb.record_success()   # HALF_OPEN→CLOSED  o  CLOSED reset fail_count
                 else:
                     cb.record_failure()
-            except Exception:
-                # Captura Timeout, ConnectionError y cualquier otro error inesperado
-                # para que el hilo daemon no muera silenciosamente.
+            except requests.exceptions.ConnectionError:
+                # ConnectionError = el worker no está corriendo. Registrar fallo real.
                 cb.record_failure()
+            except Exception:
+                # Timeout u otro error: el worker puede estar ocupado procesando un chunk.
+                # No penalizar el CB — un worker lento no es un worker caído.
+                pass
 
             # Loguear solo si el estado cambió (evita ruido en consola durante el demo)
             estado_despues = cb.state
