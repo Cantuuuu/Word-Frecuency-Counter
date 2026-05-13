@@ -415,6 +415,12 @@ if __name__ == "__main__":
     _log(f"Workers configurados: {list(config.WORKERS.keys())}")
     _log(f"FAIL_MAX={config.FAIL_MAX} | RESET_TIMEOUT={config.RESET_TIMEOUT}s | MAX_RETRIES={config.MAX_RETRIES}")
 
+    # Arrancar el health poller como daemon thread antes de Flask.
+    # daemon=True: el hilo se detiene automáticamente cuando el proceso principal termina.
+    poller = threading.Thread(target=_health_poller, daemon=True, name="health-poller")
+    poller.start()
+    _log(f"Health poller iniciado (intervalo: {config.RESET_TIMEOUT}s)")
+
     # threaded=True: Flask crea un hilo por petición, permitiendo que el
     # Coordinator envíe múltiples chunks en paralelo sin que se encolen.
     app.run(
