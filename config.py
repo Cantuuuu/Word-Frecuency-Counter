@@ -45,7 +45,10 @@ MAX_RETRIES = 3   # Intentos totales: 1 original + 2 reintentos
 # Timeout de red
 # ---------------------------------------------------------------------------
 
-REQUEST_TIMEOUT = 20   # Segundos máximos de espera por respuesta de un worker
+# En hardware real (disco local NVMe): 20s sobra para 1.7 GB.
+# En Docker Desktop macOS (filesystem virtualizado): puede necesitar 120s+.
+# Configurable vía REQUEST_TIMEOUT env var para ajustar sin tocar código.
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
 
 # ---------------------------------------------------------------------------
 # Archivo de texto
