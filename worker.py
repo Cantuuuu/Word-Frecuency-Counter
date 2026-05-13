@@ -72,9 +72,8 @@ def count_words():
     que a su vez los reenvía aquí.
 
     Body esperado (JSON):
-        chunk_id (int): identificador del fragmento para trazabilidad
-        inicio   (int): offset de byte donde empieza el fragmento
-        fin      (int): offset de byte donde termina el fragmento (no inclusivo)
+        start (int): offset de byte donde empieza el fragmento
+        end   (int): offset de byte donde termina el fragmento (no inclusivo)
 
     Retorna:
         JSON exitoso : {"worker_id": str, "status": "ok", "result": {palabra: frecuencia}}
@@ -102,34 +101,33 @@ def count_words():
             "reason": "cuerpo JSON inválido o ausente"
         }), 400
 
-    chunk_id = datos.get("chunk_id")
-    inicio   = datos.get("inicio")
-    fin      = datos.get("fin")
+    start = datos.get("start")
+    end   = datos.get("end")
 
-    # Verificar que los tres campos obligatorios estén presentes
-    if inicio is None or fin is None or chunk_id is None:
+    # Verificar que los campos obligatorios estén presentes
+    if start is None or end is None:
         return jsonify({
             "worker_id": WORKER_ID,
             "status": "error",
-            "reason": "faltan campos requeridos: chunk_id, inicio, fin"
+            "reason": "faltan campos requeridos: start, end"
         }), 400
 
     # Verificar que el rango sea válido
-    if inicio < 0 or fin <= inicio:
+    if start < 0 or end <= start:
         return jsonify({
             "worker_id": WORKER_ID,
             "status": "error",
-            "reason": f"rango inválido: inicio={inicio}, fin={fin}"
+            "reason": f"rango inválido: start={start}, end={end}"
         }), 400
 
     # --- Lectura del fragmento del archivo local ---
     try:
         with open(WIKI_PATH, "rb") as archivo:
             # Mover el cursor al byte de inicio del fragmento
-            archivo.seek(inicio)
+            archivo.seek(start)
 
-            # Leer exactamente (fin - inicio) bytes
-            fragmento_bytes = archivo.read(fin - inicio)
+            # Leer exactamente (end - start) bytes
+            fragmento_bytes = archivo.read(end - start)
 
     except FileNotFoundError:
         return jsonify({
