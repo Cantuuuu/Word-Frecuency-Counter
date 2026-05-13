@@ -1,0 +1,21 @@
+# docker-compose.worker.yml — Para las laptops que solo corren el Worker.
+#
+# Uso:
+#   WORKER_ID=worker_1 docker-compose -f docker-compose.worker.yml up --build
+#
+# Requerimientos:
+#   - wiki_es.txt debe estar en el mismo directorio que este archivo
+#   - El puerto 5001 debe estar abierto en el firewall de esta laptop
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    ports:
+      - "5001:5001"          # El Ambassador de la laptop principal conectará aquí
+    environment:
+      WORKER_ID: "${WORKER_ID:-worker_1}"   # Cambiar en cada laptop: worker_1, worker_2, worker_3
+    volumes:
+      - ./wiki_es.txt:/app/wiki_es.txt:ro  # El archivo NO entra a la imagen; se monta en runtime
+    restart: on-failure
