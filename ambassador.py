@@ -16,6 +16,16 @@ Responsabilidades:
 Puerto: 5005
 Modo: threaded=True — maneja peticiones del Coordinator en paralelo.
 
+Política de exclusión por despacho:
+  Cada llamada a /dispatch mantiene su propio conjunto `ya_fallaron`.
+  Un worker excluido en un despacho sigue disponible para otros chunks
+  que lleguen de forma concurrente; la exclusión NO es global.
+
+Traducción de contrato (inicio/fin → start/end):
+  El Coordinator habla español ({inicio, fin}); el Worker espera inglés
+  ({start, end}). La traducción ocurre en _despachar_a_worker, manteniendo
+  ambas interfaces estables sin modificar ninguno de los dos extremos.
+
 Criterios de fallo (disparan cb.record_failure):
   - requests.Timeout
   - requests.ConnectionError
@@ -61,10 +71,10 @@ circuit_breakers: dict[str, CircuitBreaker] = {
 # ---------------------------------------------------------------------------
 
 # itertools.cycle produce la secuencia infinita: w1, w2, w3, w1, w2, w3, ...
-# Se comparte entre hilos → el Lock garantiza que cada hilo avance el cursor
-# de forma atómica (sin que dos hilos escojan el mismo worker simultáneamente).
+# Se comparte entre hilos → sin el Lock, dos hilos podrían avanzar el cursor
+# en paralelo y terminar eligiendo el mismo worker en el mismo instante.
 _rr_cycle = itertools.cycle(config.WORKERS.keys())
-_rr_lock  = threading.Lock()
+_rr_lock  = threading.Lock()  # Protege el avance de _rr_cycle; solo se retiene durante next()
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +122,8 @@ def _seleccionar_worker(excluidos: set[str] | None = None) -> str | None:
 
     total_workers = len(config.WORKERS)
 
-    # Intentamos hasta 'total_workers' candidatos para no ciclar eternamente.
+    # Acotar el bucle a len(WORKERS) iteraciones garantiza terminación:
+    # en el peor caso revisamos cada worker exactamente una vez antes de rendirse.
     for _ in range(total_workers):
         with _rr_lock:
             candidato = next(_rr_cycle)
@@ -170,6 +181,7 @@ def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
     url = f"{config.WORKERS[worker_id]}/count"
     cb  = circuit_breakers[worker_id]
 
+    # Traducir de la interfaz del Coordinator (inicio/fin) a la del Worker (start/end).
     worker_payload = {"start": payload["inicio"], "end": payload["fin"]}
 
     try:
@@ -257,7 +269,8 @@ def dispatch():
     _log(f"Chunk recibido      : chunk_{chunk_id} (bytes {inicio} → {fin})")
 
     payload    = {"chunk_id": chunk_id, "inicio": inicio, "fin": fin}
-    ya_fallaron: set[str] = set()  # Workers que fallaron en este despacho
+    # Conjunto local a este despacho: excluye workers fallidos sin afectar otros chunks concurrentes.
+    ya_fallaron: set[str] = set()
 
     for intento in range(1, config.MAX_RETRIES + 1):
 
@@ -274,8 +287,8 @@ def dispatch():
             }), 503
 
         cb = circuit_breakers[worker_id]
-        # Capturar el estado ANTES del call: record_success() ya habrá
-        # transicionado a CLOSED cuando leamos cb.state después.
+        # Capturar ANTES del call: si la prueba tiene éxito, record_success()
+        # transiciona el CB a CLOSED y el estado original se perdería.
         era_half_open = cb.state.value == "HALF_OPEN"
         _log(f"Worker seleccionado : {worker_id}")
         _log(f"Estado CB {worker_id:<12}: {cb.state.value} {'🟢' if cb.state.value == 'CLOSED' else '🟡' if cb.state.value == 'HALF_OPEN' else '🔴'}")
