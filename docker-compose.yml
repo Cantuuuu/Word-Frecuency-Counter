@@ -43,13 +43,20 @@ services:
     restart: on-failure
 
   # ---------------------------------------------------------------------------
-  # Coordinator — placeholder (pendiente del compañero)
+  # Coordinator — divide el archivo y despacha chunks al Ambassador.
+  # Es un proceso de un solo uso (run-to-completion): arranca, ejecuta el
+  # benchmark y termina. Por eso no tiene restart ni puertos expuestos.
   # ---------------------------------------------------------------------------
-  # coordinator:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.coordinator
-  #   ports:
-  #     - "4999:4999"
-  #   depends_on:
-  #     - ambassador
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    restart: "no"
+    environment:
+      AMBASSADOR_URL: "http://ambassador:5005"
+      FILE_PATH: "/app/wiki_es.txt"
+      NUM_CHUNKS: "3"
+    volumes:
+      - ./wiki_es.txt:/app/wiki_es.txt:ro
+    depends_on:
+      - ambassador
