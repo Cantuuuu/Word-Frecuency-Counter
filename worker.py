@@ -2,10 +2,14 @@
 worker.py — Servidor HTTP que cuenta frecuencia de palabras en un rango del archivo.
 
 Responsabilidades:
-  - Recibir un rango de bytes (inicio, fin) desde el Ambassador.
-  - Leer ese fragmento del archivo wiki_es.txt almacenado localmente.
+  - Recibir un rango de bytes (start, end) desde el Ambassador.
+  - Leer ese fragmento del archivo wiki_es.txt almacenado localmente
+    (el archivo NUNCA viaja por red — cada laptop tiene su propia copia).
   - Limpiar el texto y contar palabras con collections.Counter.
   - Responder con el diccionario de frecuencias.
+
+Nota: el Ambassador traduce los campos del Coordinator (inicio/fin → start/end)
+antes de reenviar la petición aquí.
 
 Puerto: 5001
 """
@@ -28,10 +32,12 @@ WORKER_ID = os.getenv("WORKER_ID", "worker_1")
 # Ruta al archivo de texto dentro del contenedor Docker
 WIKI_PATH = os.getenv("WIKI_PATH", "/app/wiki_es.txt")
 
-# Segundos de delay artificial — útil para simular latencia en pruebas
+# DELAY: segundos de latencia artificial para probar que el Circuit Breaker
+# detecta timeouts y abre el circuito ante respuestas lentas.
 DELAY = float(os.getenv("DELAY", "0"))
 
-# Si es "true", el worker responde siempre con error — útil para probar el Circuit Breaker
+# FAIL_MODE: si es "true", cada petición devuelve HTTP 500 para disparar
+# el contador de fallos del Circuit Breaker y forzar la transición CLOSED→OPEN.
 FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 
 
@@ -39,8 +45,10 @@ FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 # Regex para extraer palabras
 # ---------------------------------------------------------------------------
 
-# Captura secuencias de letras (incluye tildes, ñ y diéresis del español).
-# \b es word boundary; [a-záéíóúüñ]+ captura solo letras, sin números ni signos.
+# Compilado a nivel de módulo (no dentro de la función) para que el motor de
+# expresiones regulares lo procese una sola vez al arrancar, en lugar de
+# recompilarlo en cada petición — mejora el rendimiento bajo carga alta.
+# \b = word boundary; [a-záéíóúüñ]+ = solo letras españolas (tildes, ñ, ü incluidos).
 PATRON_PALABRAS = re.compile(r"\b[a-záéíóúüñ]+\b")
 
 
@@ -122,6 +130,9 @@ def count_words():
 
     # --- Lectura del fragmento del archivo local ---
     try:
+        # Modo "rb" (binario) en lugar de texto para poder hacer seek() exacto
+        # a un offset de bytes y decodificar manualmente con errors="replace".
+        # En modo texto Python podría ajustar offsets según BOM o fin de línea.
         with open(WIKI_PATH, "rb") as archivo:
             # Mover el cursor al byte de inicio del fragmento
             archivo.seek(start)
@@ -144,9 +155,10 @@ def count_words():
         }), 500
 
     # --- Decodificación de bytes a texto ---
-    # errors="replace" evita que un corte en medio de un carácter UTF-8
-    # multi-byte (ej. una vocal con tilde) lance una excepción.
-    # El carácter corrupto se reemplaza por "?" y se ignora en el conteo.
+    # errors="replace" (no "ignore") evita que un corte en medio de un carácter
+    # UTF-8 multi-byte (ej. vocal con tilde al borde del chunk) lance una excepción.
+    # El byte inválido se reemplaza por U+FFFD ("?"), que el regex no captura
+    # como letra y queda fuera del conteo — comportamiento correcto y seguro.
     texto = fragmento_bytes.decode("utf-8", errors="replace")
 
     # --- Conteo de palabras ---
