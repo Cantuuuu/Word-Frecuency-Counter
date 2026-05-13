@@ -1,33 +1,26 @@
-# docker-compose.yml — Orquestación del Ambassador y un worker local para pruebas.
+# docker-compose.yml — Orquestación local: Ambassador + worker_local + Coordinator
 #
-# Topología completa del proyecto:
-#   - Esta laptop:      Ambassador (:5000)
-#   - Laptops remotas:  3× Workers (:5001) — cada una hace docker run por separado
-#
-# Para el día de la demo:
-#   1. Copiar .env.example → .env y actualizar IPs.
-#   2. Ejecutar: docker-compose up --build
-#   3. En cada laptop de worker: docker run (ver CLAUDE.md)
+# Para la demo en red:
+#   - Levantar este archivo en tu laptop (Ambassador + Coordinator).
+#   - En cada laptop worker: docker run con AMBASSADOR_URL y WORKER_URL.
+#   - No se necesita .env — los workers se registran solos al arrancar.
 
 services:
 
   # ---------------------------------------------------------------------------
-  # Ambassador — intermediario entre Coordinator y Workers
+  # Ambassador — recibe registros de workers y despacha chunks
   # ---------------------------------------------------------------------------
   ambassador:
     build:
       context: .
       dockerfile: Dockerfile.ambassador
     ports:
-      - "5005:5005"          # Expone el Ambassador a la red local
-    env_file:
-      - .env                 # IPs de los workers (WORKER_1_URL, WORKER_2_URL, ...)
-    restart: on-failure      # Reiniciar automáticamente si el proceso muere
+      - "5005:5005"
+    restart: on-failure
 
   # ---------------------------------------------------------------------------
   # Worker local — para pruebas en una sola laptop sin red real
   # ---------------------------------------------------------------------------
-  # Para usarlo en la demo real, elimina este servicio y usa las laptops remotas.
   worker_local:
     build:
       context: .
@@ -35,15 +28,17 @@ services:
     ports:
       - "5001:5001"
     environment:
-      WORKER_ID: "worker_local"
+      WORKER_ID:      "worker_local"
+      AMBASSADOR_URL: "http://ambassador:5005"
+      WORKER_URL:     "http://worker_local:5001"
     volumes:
-      # Bind mount del archivo de 5GB — el archivo NO entra a la imagen Docker.
-      # Usamos ./wiki_es.txt ya que el archivo se encuentra en el mismo directorio
       - ./wiki_es.txt:/app/data/input.txt:ro
+    depends_on:
+      - ambassador
     restart: on-failure
 
   # ---------------------------------------------------------------------------
-  # Coordinator — divide el archivo y despacha chunks al Ambassador
+  # Coordinator — espera workers, divide archivo y despacha chunks
   # ---------------------------------------------------------------------------
   coordinator:
     build:
@@ -53,9 +48,10 @@ services:
       - "4999:4999"
     environment:
       AMBASSADOR_URL: "http://ambassador:5005"
-      FILE_PATH: "/app/wiki_es.txt"
-      NUM_CHUNKS: "3"
+      FILE_PATH:      "/app/wiki_es.txt"
+      MIN_WORKERS:    "1"
     volumes:
       - ./wiki_es.txt:/app/wiki_es.txt:ro
     depends_on:
       - ambassador
+    restart: on-failure

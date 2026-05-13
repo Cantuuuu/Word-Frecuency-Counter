@@ -3,14 +3,17 @@ from collections import Counter
 import re
 import os
 import time
+import requests
 
 app = Flask(__name__)
 
-WORKER_ID = os.getenv("WORKER_ID", "worker_1")
-PORT = int(os.getenv("PORT", "5001"))
-FILE_PATH = os.getenv("FILE_PATH", "/app/data/input.txt")
+WORKER_ID      = os.getenv("WORKER_ID", "worker_1")
+PORT           = int(os.getenv("PORT", "5001"))
+FILE_PATH      = os.getenv("FILE_PATH", "/app/data/input.txt")
+AMBASSADOR_URL = os.getenv("AMBASSADOR_URL", "")
+WORKER_URL     = os.getenv("WORKER_URL", f"http://localhost:{PORT}")
 
-DELAY = float(os.getenv("DELAY", "0"))
+DELAY     = float(os.getenv("DELAY", "0"))
 FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 
 
@@ -18,24 +21,16 @@ FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
 def health():
     return jsonify({
         "worker_id": WORKER_ID,
-        "status": "ok",
-        "file_path": FILE_PATH
+        "status":    "ok",
+        "file_path": FILE_PATH,
     })
 
 
-BUFFER_SIZE  = 64 * 1024 * 1024  # 64 MB por bloque — evita OOM con chunks de varios GB
-BOUNDARY_BUF = 512               # Bytes extra a leer para detectar límite de palabra
+BUFFER_SIZE  = 64 * 1024 * 1024  # 64 MB por bloque
+BOUNDARY_BUF = 512               # Bytes extra para detectar límite de palabra
 
 
 def _ajustar_inicio(file, start: int) -> int:
-    """
-    Si start > 0, avanza hasta el primer espacio en blanco.
-
-    El chunk anterior es responsable de la palabra que cruza el límite:
-    él leerá hasta el espacio. Este chunk la salta para no contarla doble.
-
-    Retorna el start ajustado (posición después del espacio).
-    """
     if start == 0:
         return 0
     file.seek(start)
@@ -46,27 +41,6 @@ def _ajustar_inicio(file, start: int) -> int:
 
 
 def count_words_from_file(file_path, start, end):
-    """
-    Cuenta palabras en el rango de bytes [start, end) del archivo,
-    alineando los límites a fronteras de palabra para evitar fragmentos.
-
-    Estrategia de límites:
-      - Inicio (start > 0): avanza hasta el primer espacio — salta el
-        fragmento inicial que pertenece al chunk anterior.
-      - Final: lee hasta BOUNDARY_BUF bytes extra más allá de end para
-        completar la palabra que cruza el límite. El chunk siguiente la
-        saltará con el ajuste de inicio.
-
-    Lee en bloques de BUFFER_SIZE para mantener el uso de RAM acotado.
-
-    Parámetros:
-        file_path (str): Ruta al archivo de texto.
-        start     (int): Byte de inicio nominal (puede ajustarse hacia adelante).
-        end       (int): Byte de fin nominal (puede extenderse hasta el próximo espacio).
-
-    Retorna:
-        Counter: Frecuencia de cada palabra en el rango ajustado.
-    """
     counter = Counter()
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
@@ -76,13 +50,11 @@ def count_words_from_file(file_path, start, end):
 
         while remaining > 0:
             to_read = min(BUFFER_SIZE, remaining)
-            chunk = file.read(to_read)
+            chunk   = file.read(to_read)
             if not chunk:
                 break
             remaining -= len(chunk.encode("utf-8", errors="ignore"))
 
-            # Último bloque: leer caracteres extra hasta el próximo espacio
-            # para capturar completa la palabra que cruza el límite de fin.
             if remaining <= 0:
                 extra = file.read(BOUNDARY_BUF)
                 for i, ch in enumerate(extra):
@@ -90,7 +62,7 @@ def count_words_from_file(file_path, start, end):
                         chunk += extra[:i]
                         break
                 else:
-                    chunk += extra  # llegamos al EOF sin encontrar espacio
+                    chunk += extra
 
             words = re.findall(r"\b\w+\b", chunk.lower())
             counter.update(words)
@@ -101,28 +73,54 @@ def count_words_from_file(file_path, start, end):
 @app.route("/count", methods=["POST"])
 def count_words():
     if FAIL_MODE:
-        return jsonify({
-            "worker_id": WORKER_ID,
-            "error": "simulated failure"
-        }), 500
+        return jsonify({"worker_id": WORKER_ID, "error": "simulated failure"}), 500
 
     if DELAY > 0:
         time.sleep(DELAY)
 
-    data = request.get_json()
-
+    data  = request.get_json()
     start = int(data.get("start", 0))
-    end = int(data.get("end", 0))
+    end   = int(data.get("end", 0))
 
     result = count_words_from_file(FILE_PATH, start, end)
 
     return jsonify({
         "worker_id": WORKER_ID,
-        "start": start,
-        "end": end,
-        "result": dict(result)
+        "start":  start,
+        "end":    end,
+        "result": dict(result),
     })
 
 
+# ---------------------------------------------------------------------------
+# Registro dinámico con el Ambassador
+# ---------------------------------------------------------------------------
+
+def register_with_ambassador(max_attempts: int = 15, delay: float = 2.0) -> None:
+    """
+    Anuncia este worker al Ambassador para entrar al pool dinámico.
+    Reintenta hasta max_attempts veces (el Ambassador puede no estar listo aún).
+    """
+    if not AMBASSADOR_URL:
+        print(f"[WORKER {WORKER_ID}] AMBASSADOR_URL no configurado — modo standalone", flush=True)
+        return
+
+    url     = f"{AMBASSADOR_URL}/register"
+    payload = {"worker_id": WORKER_ID, "url": WORKER_URL}
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=5)
+            if r.status_code == 200:
+                print(f"[WORKER {WORKER_ID}] Registrado en Ambassador: {WORKER_URL}", flush=True)
+                return
+        except Exception as e:
+            print(f"[WORKER {WORKER_ID}] Intento {attempt}/{max_attempts} fallido: {e}", flush=True)
+        time.sleep(delay)
+
+    print(f"[WORKER {WORKER_ID}] No se pudo registrar tras {max_attempts} intentos", flush=True)
+
+
 if __name__ == "__main__":
+    register_with_ambassador()
     app.run(host="0.0.0.0", port=PORT)

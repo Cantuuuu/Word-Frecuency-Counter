@@ -2,25 +2,14 @@
 ambassador.py — Intermediario entre el Coordinator y los Workers.
 
 Responsabilidades:
+  - Registrar workers dinámicamente (POST /register).
   - Recibir chunks del Coordinator (POST /dispatch).
-  - Seleccionar un worker disponible mediante Round-Robin Inteligente:
-      antes de despachar, consulta cb.allow_request(); si el worker
-      está en OPEN lo salta automáticamente.
+  - Seleccionar un worker disponible mediante Round-Robin Inteligente.
   - Reenviar el chunk al worker seleccionado (POST /count).
-  - Gestionar fallos y reintentos (MAX_RETRIES intentos, rotando worker
-      en cada reintento, sin delay entre ellos).
-  - Registrar éxitos y fallos en el Circuit Breaker correspondiente.
-  - Loggear cada evento con el formato exacto requerido para la demo.
-  - Exponer el estado de todos los CBs en GET /workers/status.
+  - Gestionar fallos con Circuit Breaker por worker.
+  - Exponer estado en GET /workers/status.
 
-Puerto: 5000
-Modo: threaded=True — maneja peticiones del Coordinator en paralelo.
-
-Criterios de fallo (disparan cb.record_failure):
-  - requests.Timeout
-  - requests.ConnectionError
-  - Respuesta HTTP con status_code != 200
-  - JSON del worker con "status": "error"
+Puerto: 5005
 """
 
 import itertools
@@ -34,51 +23,39 @@ import config
 from circuit_breaker_mock import CircuitBreaker, CircuitBreakerOpen
 
 # ---------------------------------------------------------------------------
-# Inicialización de la aplicación Flask
+# Aplicación Flask
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Circuit Breakers — uno por worker
+# Registro dinámico de workers
 # ---------------------------------------------------------------------------
 
-# Diccionario: worker_id → instancia de CircuitBreaker
-# Se crea una sola vez al arrancar el servidor; las peticiones concurrentes
-# comparten estas instancias (cada CB es internamente thread-safe).
-circuit_breakers: dict[str, CircuitBreaker] = {
-    worker_id: CircuitBreaker(
-        name=worker_id,
-        fail_max=config.FAIL_MAX,
-        reset_timeout=config.RESET_TIMEOUT,
-    )
-    for worker_id in config.WORKERS
-}
+# worker_id → URL base (ej. "http://148.220.1.1:5001")
+# Se llena en tiempo de ejecución cuando los workers llaman a POST /register.
+_workers: dict[str, str] = {}
+_workers_lock = threading.Lock()
+
+# Circuit Breakers — se crean al registrar cada worker
+circuit_breakers: dict[str, CircuitBreaker] = {}
 
 # ---------------------------------------------------------------------------
-# Round-Robin
+# Round-Robin dinámico
 # ---------------------------------------------------------------------------
 
-# itertools.cycle produce la secuencia infinita: w1, w2, w3, w1, w2, w3, ...
-# Se comparte entre hilos → el Lock garantiza que cada hilo avance el cursor
-# de forma atómica (sin que dos hilos escojan el mismo worker simultáneamente).
-_rr_cycle = itertools.cycle(config.WORKERS.keys())
+# Índice global que avanza sobre la lista actual de workers.
+# Al ser dinámico (workers se agregan en runtime), usamos un índice entero
+# en lugar de itertools.cycle (que congela la secuencia al crearse).
+_rr_index = 0
 _rr_lock  = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Logging con formato demo
+# Logging
 # ---------------------------------------------------------------------------
 
 def _log(mensaje: str) -> None:
-    """
-    Imprime un mensaje de log con el formato requerido para la demo.
-
-    Formato: [AMB HH:MM:SS] Mensaje
-
-    Parámetros:
-        mensaje (str): Texto del evento a registrar.
-    """
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[AMB {timestamp}] {mensaje}", flush=True)
 
@@ -89,47 +66,39 @@ def _log(mensaje: str) -> None:
 
 def _seleccionar_worker(excluidos: set[str] | None = None) -> str | None:
     """
-    Elige el próximo worker disponible usando Round-Robin Inteligente.
+    Elige el próximo worker disponible usando Round-Robin sobre el pool
+    dinámico actual. Salta workers con CB en OPEN o que ya fallaron.
 
-    "Inteligente" significa que antes de elegir un worker, consulta su Circuit
-    Breaker. Si el CB está en OPEN (allow_request() devuelve False), ese worker
-    se salta y se intenta con el siguiente en el ciclo.
-
-    Se prueban como máximo len(WORKERS) candidatos para evitar un bucle infinito
-    cuando todos los workers están en OPEN.
-
-    Parámetros:
-        excluidos (set[str] | None): IDs de workers que ya fallaron en este
-            intento y no deben repetirse. Si es None se trata como conjunto vacío.
-
-    Retorna:
-        str  : ID del worker seleccionado (ej. "worker_1").
-        None : Si ningún worker está disponible (todos en OPEN o en excluidos).
+    Retorna None si no hay ningún worker disponible.
     """
+    global _rr_index
+
     if excluidos is None:
         excluidos = set()
 
-    total_workers = len(config.WORKERS)
+    with _workers_lock:
+        worker_ids = list(_workers.keys())
 
-    # Intentamos hasta 'total_workers' candidatos para no ciclar eternamente.
-    for _ in range(total_workers):
+    total = len(worker_ids)
+    if total == 0:
+        return None
+
+    for _ in range(total):
         with _rr_lock:
-            candidato = next(_rr_cycle)
+            idx       = _rr_index % total
+            _rr_index += 1
+            candidato = worker_ids[idx]
 
-        # Saltar workers que ya fallaron en este conjunto de reintentos
         if candidato in excluidos:
             continue
 
-        cb = circuit_breakers[candidato]
-
-        if cb.allow_request():
+        cb = circuit_breakers.get(candidato)
+        if cb and cb.allow_request():
             return candidato
 
-        # El CB está OPEN: logear el bloqueo y probar el siguiente
         _log(f"Estado CB {candidato:<12}: OPEN 🔴 — bloqueado")
         _log(f"Fast-fail           : intentando siguiente worker")
 
-    # Ningún worker disponible
     return None
 
 
@@ -139,34 +108,20 @@ def _seleccionar_worker(excluidos: set[str] | None = None) -> str | None:
 
 def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
     """
-    Envía el chunk de trabajo al worker indicado y gestiona el resultado.
+    Envía el chunk al worker indicado, traduciendo el contrato:
+        Coordinator envía {chunk_id, inicio, fin}
+        Worker espera   {start, end}
 
-    En caso de éxito llama a cb.record_success().
-    En caso de cualquier fallo llama a cb.record_failure() y lanza una
-    excepción para que el bucle de reintentos lo maneje.
-
-    Criterios de fallo:
-      - requests.exceptions.Timeout       → timeout de red
-      - requests.exceptions.ConnectionError → worker inaccesible
-      - HTTP status_code != 200           → error del servidor
-      - JSON con "status": "error"        → error lógico reportado por el worker
-
-    Nota de traducción de contrato:
-        El Coordinator envía {chunk_id, inicio, fin} al Ambassador.
-        El Worker espera {start, end}. Esta función traduce el payload
-        antes de reenviar, manteniendo ambas interfaces sin modificarlas.
-
-    Parámetros:
-        worker_id (str) : ID del worker destino (ej. "worker_1").
-        payload   (dict): Cuerpo JSON recibido del Coordinator: {chunk_id, inicio, fin}.
-
-    Retorna:
-        dict: El campo "result" del JSON de respuesta del worker.
-
-    Lanza:
-        RuntimeError: En cualquiera de los criterios de fallo descritos.
+    Registra éxito/fallo en el Circuit Breaker correspondiente.
+    Lanza RuntimeError ante cualquier fallo.
     """
-    url = f"{config.WORKERS[worker_id]}/count"
+    with _workers_lock:
+        url_base = _workers.get(worker_id)
+
+    if not url_base:
+        raise RuntimeError(f"Worker {worker_id} no registrado")
+
+    url = f"{url_base}/count"
     cb  = circuit_breakers[worker_id]
 
     worker_payload = {"start": payload["inicio"], "end": payload["fin"]}
@@ -185,23 +140,16 @@ def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
         cb.record_failure()
         raise RuntimeError(f"Sin conexión con {worker_id}")
 
-    # Cualquier código HTTP que no sea 200 se trata como fallo
     if respuesta.status_code != 200:
         cb.record_failure()
-        raise RuntimeError(
-            f"{worker_id} respondió HTTP {respuesta.status_code}"
-        )
+        raise RuntimeError(f"{worker_id} respondió HTTP {respuesta.status_code}")
 
     datos = respuesta.json()
 
-    # El worker puede responder 200 pero indicar un error lógico en el JSON
     if datos.get("status") == "error":
         cb.record_failure()
-        raise RuntimeError(
-            f"{worker_id} reportó error: {datos.get('reason', 'desconocido')}"
-        )
+        raise RuntimeError(f"{worker_id} reportó error: {datos.get('reason', 'desconocido')}")
 
-    # Llegamos aquí solo si todo fue bien
     cb.record_success()
     return datos.get("result", {})
 
@@ -210,35 +158,57 @@ def _despachar_a_worker(worker_id: str, payload: dict) -> dict:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.route("/register", methods=["POST"])
+def register():
+    """
+    Registra un worker en el pool dinámico.
+
+    Body esperado (JSON):
+        worker_id (str): Identificador único del worker (ej. "worker_1").
+        url       (str): URL base accesible del worker (ej. "http://148.x.x.x:5001").
+
+    Retorna:
+        {"status": "ok", "worker_id": str, "total_workers": int}
+    """
+    datos = request.get_json(silent=True)
+    if not datos:
+        return jsonify({"status": "error", "reason": "JSON inválido"}), 400
+
+    worker_id = datos.get("worker_id")
+    url       = datos.get("url")
+
+    if not worker_id or not url:
+        return jsonify({"status": "error", "reason": "faltan worker_id o url"}), 400
+
+    with _workers_lock:
+        _workers[worker_id] = url
+        if worker_id not in circuit_breakers:
+            circuit_breakers[worker_id] = CircuitBreaker(
+                name=worker_id,
+                fail_max=config.FAIL_MAX,
+                reset_timeout=config.RESET_TIMEOUT,
+            )
+        total = len(_workers)
+
+    _log(f"Worker registrado   : {worker_id} @ {url}  (total: {total})")
+    return jsonify({"status": "ok", "worker_id": worker_id, "total_workers": total})
+
+
 @app.route("/dispatch", methods=["POST"])
 def dispatch():
     """
     Recibe un chunk del Coordinator y lo despacha a un worker disponible.
 
-    Implementa la política de reintentos con rotación:
-      - Intento 1: worker seleccionado por round-robin.
-      - Intento 2: worker diferente al que falló (excluido del ciclo).
-      - Intento 3: ídem, evitando los dos anteriores.
-    Los reintentos son inmediatos (sin delay).
-
     Body esperado (JSON):
         chunk_id (int): Identificador del fragmento.
-        inicio   (int): Byte de inicio del fragmento (inclusivo).
-        fin      (int): Byte de fin del fragmento (exclusivo).
-
-    Retorna (JSON exitoso):
-        {"chunk_id": int, "worker_id": str, "status": "ok", "result": dict}
-
-    Retorna (JSON de error):
-        {"chunk_id": int|None, "worker_id": null, "status": "error", "reason": str}
+        inicio   (int): Byte de inicio (inclusivo).
+        fin      (int): Byte de fin (exclusivo).
     """
     datos = request.get_json(silent=True)
     if not datos:
         return jsonify({
-            "chunk_id":  None,
-            "worker_id": None,
-            "status":    "error",
-            "reason":    "cuerpo JSON inválido o ausente",
+            "chunk_id": None, "worker_id": None,
+            "status": "error", "reason": "cuerpo JSON inválido o ausente",
         }), 400
 
     chunk_id = datos.get("chunk_id")
@@ -247,29 +217,24 @@ def dispatch():
 
     if chunk_id is None or inicio is None or fin is None:
         return jsonify({
-            "chunk_id":  chunk_id,
-            "worker_id": None,
-            "status":    "error",
-            "reason":    "faltan campos: chunk_id, inicio, fin",
+            "chunk_id": chunk_id, "worker_id": None,
+            "status": "error", "reason": "faltan campos: chunk_id, inicio, fin",
         }), 400
 
     _log(f"Chunk recibido      : chunk_{chunk_id} (bytes {inicio} → {fin})")
 
-    payload    = {"chunk_id": chunk_id, "inicio": inicio, "fin": fin}
-    ya_fallaron: set[str] = set()  # Workers que fallaron en este despacho
+    payload      = {"chunk_id": chunk_id, "inicio": inicio, "fin": fin}
+    ya_fallaron: set[str] = set()
 
     for intento in range(1, config.MAX_RETRIES + 1):
 
-        # Seleccionar worker disponible (excluyendo los que ya fallaron)
         worker_id = _seleccionar_worker(excluidos=ya_fallaron)
 
         if worker_id is None:
-            _log("Todos los workers OPEN — abortando chunk")
+            _log("Sin workers disponibles — abortando chunk")
             return jsonify({
-                "chunk_id":  chunk_id,
-                "worker_id": None,
-                "status":    "error",
-                "reason":    "all_workers_open",
+                "chunk_id": chunk_id, "worker_id": None,
+                "status": "error", "reason": "no_workers_available",
             }), 503
 
         cb = circuit_breakers[worker_id]
@@ -279,73 +244,53 @@ def dispatch():
 
         try:
             import time as _time
-            t_inicio  = _time.monotonic()
+            t0        = _time.monotonic()
             resultado = _despachar_a_worker(worker_id, payload)
-            t_fin     = _time.monotonic()
+            elapsed   = _time.monotonic() - t0
 
-            _log(f"Tiempo de respuesta : {t_fin - t_inicio:.3f}s")
+            _log(f"Tiempo de respuesta : {elapsed:.3f}s")
             _log(f"Resultado           : OK ✓")
 
-            # Verificar si el CB acababa de recuperarse (transición HALF_OPEN → CLOSED)
-            if cb.state.value == "CLOSED" and worker_id in ya_fallaron:
-                _log(f"Prueba exitosa      : CB {worker_id} → CLOSED 🟢")
-
             return jsonify({
-                "chunk_id":  chunk_id,
-                "worker_id": worker_id,
-                "status":    "ok",
-                "result":    resultado,
+                "chunk_id": chunk_id, "worker_id": worker_id,
+                "status": "ok", "result": resultado,
             })
 
         except RuntimeError as error:
             _log(f"Fallo en {worker_id}    : {error}")
             ya_fallaron.add(worker_id)
-
             if intento < config.MAX_RETRIES:
                 _log(f"Reintentando        : intento {intento + 1} / {config.MAX_RETRIES}")
 
-    # Se agotaron todos los reintentos sin éxito
     _log(f"Max reintentos agotados para chunk_{chunk_id}")
     return jsonify({
-        "chunk_id":  chunk_id,
-        "worker_id": None,
-        "status":    "error",
-        "reason":    "max_retries_exceeded",
+        "chunk_id": chunk_id, "worker_id": None,
+        "status": "error", "reason": "max_retries_exceeded",
     }), 502
 
 
 @app.route("/workers/status", methods=["GET"])
 def workers_status():
     """
-    Retorna el estado actual de todos los Circuit Breakers.
-
-    Útil para monitorear la salud del sistema durante la demo.
-
-    Retorna (JSON):
-        {
-          "activos": ["worker_1", ...],   # workers en estado CLOSED
-          "n": int,                        # total de workers activos
-          "detalle": { worker_id: {name, state, fail_count, seconds_open} }
-        }
+    Retorna el estado actual del pool dinámico y los Circuit Breakers.
     """
-    detalle = {wid: cb.get_status() for wid, cb in circuit_breakers.items()}
-    activos = [wid for wid, info in detalle.items() if info["state"] == "CLOSED"]
+    with _workers_lock:
+        registered = dict(_workers)
+
+    detalle = {wid: circuit_breakers[wid].get_status() for wid in registered}
+    activos  = [wid for wid, info in detalle.items() if info["state"] == "CLOSED"]
 
     return jsonify({
-        "activos": activos,
-        "n":       len(activos),
-        "detalle": detalle,
+        "registered":   list(registered.keys()),
+        "n_registered": len(registered),
+        "activos":      activos,
+        "n":            len(activos),
+        "detalle":      detalle,
     })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """
-    Health check del Ambassador — confirma que el servidor está vivo.
-
-    Retorna:
-        JSON: {"status": "ok", "service": "ambassador"}
-    """
     return jsonify({"status": "ok", "service": "ambassador"})
 
 
@@ -354,12 +299,9 @@ def health():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _log("Iniciando Ambassador")
-    _log(f"Workers configurados: {list(config.WORKERS.keys())}")
+    _log("Iniciando Ambassador — esperando registros de workers")
     _log(f"FAIL_MAX={config.FAIL_MAX} | RESET_TIMEOUT={config.RESET_TIMEOUT}s | MAX_RETRIES={config.MAX_RETRIES}")
 
-    # threaded=True: Flask crea un hilo por petición, permitiendo que el
-    # Coordinator envíe múltiples chunks en paralelo sin que se encolen.
     app.run(
         host=config.AMBASSADOR_HOST,
         port=config.AMBASSADOR_PORT,
