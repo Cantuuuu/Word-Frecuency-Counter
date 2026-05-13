@@ -10,3 +10,6 @@ __pycache__/
 
 # Ignorar logs
 *_logs.txt
+
+# Documentación local (diagramas)
+docs/
