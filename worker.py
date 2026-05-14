@@ -193,7 +193,7 @@ def count_words():
 _registered = threading.Event()
 
 
-def _registration_loop(interval: float = 5.0) -> None:
+def _registration_loop(interval: float = 15.0) -> None:
     """
     Hilo daemon que mantiene el registro con el Ambassador.
 

@@ -27,9 +27,7 @@ RESET_TIMEOUT = 10   # Segundos en OPEN antes de pasar a HALF_OPEN
 # Política de reintentos
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES = 2   # Intentos por chunk en el Ambassador (2 = 1 reintento real).
-                  # El coordinator también hace un pase de auto-reintento al final
-                  # para chunks que fallaron en todos los intentos del Ambassador.
+MAX_RETRIES = 3   # Intentos por chunk en el Ambassador (3 = 2 reintentos reales).
 
 # ---------------------------------------------------------------------------
 # Timeout de red

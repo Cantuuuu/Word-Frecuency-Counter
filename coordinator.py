@@ -172,7 +172,7 @@ def _run_processing(
         resultados: dict[int, dict] = {}
 
         # Máximo de intentos por chunk (despacho original + reintentos inmediatos)
-        max_intentos = 2
+        max_intentos = 4
         intentos: dict[int, int] = {}
 
         # --- Despacho con reintento inmediato ---
