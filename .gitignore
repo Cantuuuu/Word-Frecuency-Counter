@@ -1,7 +1,7 @@
 # Ignorar archivos masivos
 wiki_es.txt
 *.txt
-!requierements.txt
+!requirements.txt
 
 # Ignorar archivos de entorno
 .env
