@@ -34,7 +34,6 @@ services:
     ports:
       - "5001:5001"
     environment:
-      WORKER_ID:      "worker_local"
       AMBASSADOR_URL: "http://ambassador:5005"
       WORKER_URL:     "http://worker_local:5001"
     volumes:

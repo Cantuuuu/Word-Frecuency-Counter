@@ -7,7 +7,7 @@ Endpoints:
   POST /count   → procesa el rango [start, end) y retorna {word: count, ...}
 
 Variables de entorno:
-  WORKER_ID      — identificador único (default: "worker_1")
+  WORKER_ID      — (opcional) override manual; normalmente lo asigna el Ambassador
   PORT           — puerto de escucha (default: 5001)
   FILE_PATH      — ruta al archivo de texto (default: "/app/data/input.txt")
   AMBASSADOR_URL — URL del Ambassador para auto-registro (default: "")
@@ -44,11 +44,13 @@ app = Flask(__name__)
 # Configuración desde entorno (defaults desde config donde aplica)
 # ---------------------------------------------------------------------------
 
-WORKER_ID      = os.getenv("WORKER_ID", "worker_1")
 PORT           = int(os.getenv("PORT", "5001"))
 FILE_PATH      = os.getenv("FILE_PATH", "/app/data/input.txt")
 AMBASSADOR_URL = os.getenv("AMBASSADOR_URL", "")
 WORKER_URL     = os.getenv("WORKER_URL", f"http://localhost:{PORT}")
+
+# El Ambassador asigna el ID al registrarse; antes del registro se usa un placeholder.
+WORKER_ID      = os.getenv("WORKER_ID", "worker_sin_registrar")
 
 DELAY     = float(os.getenv("DELAY", "0"))
 FAIL_MODE = os.getenv("FAIL_MODE", "false").lower() == "true"
@@ -190,19 +192,24 @@ def count_words():
 def register_with_ambassador(max_attempts: int = 15, delay: float = 2.0) -> None:
     """
     Anuncia este worker al Ambassador para entrar al pool dinámico.
+    El Ambassador asigna el worker_id centralmente y lo devuelve.
     Reintenta hasta max_attempts veces (el Ambassador puede no estar listo aún).
     """
+    global WORKER_ID
+
     if not AMBASSADOR_URL:
         logger.info(f"[{WORKER_ID}] AMBASSADOR_URL no configurado — modo standalone")
         return
 
     url     = f"{AMBASSADOR_URL}/register"
-    payload = {"worker_id": WORKER_ID, "url": WORKER_URL}
+    payload = {"url": WORKER_URL}
 
     for attempt in range(1, max_attempts + 1):
         try:
             r = requests.post(url, json=payload, timeout=5)
             if r.status_code == 200:
+                data = r.json()
+                WORKER_ID = data.get("worker_id", WORKER_ID)
                 logger.info(f"[{WORKER_ID}] Registrado en Ambassador: {WORKER_URL}")
                 return
         except Exception as e:

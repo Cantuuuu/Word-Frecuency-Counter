@@ -56,6 +56,12 @@ app = Flask(__name__)
 _workers: dict[str, str] = {}
 _workers_lock = threading.Lock()
 
+# Contador autoincremental para asignar worker_id centralmente
+_next_worker_num = 1
+
+# URL → worker_id asignado (evita duplicados si la misma URL se re-registra)
+_url_to_id: dict[str, str] = {}
+
 # Circuit Breakers — uno por worker, creado al registrarse
 circuit_breakers: dict[str, CircuitBreaker] = {}
 
@@ -96,23 +102,37 @@ def _load_registry() -> None:
     """
     Carga el registro de workers persistido al arrancar el Ambassador.
 
+    Reconstruye _url_to_id y _next_worker_num para que los IDs
+    autoincrementales continúen donde se quedaron.
     Los Circuit Breakers se crean en estado CLOSED para cada worker cargado.
     Si un worker ya no está disponible, el CB lo detectará en el primer fallo.
     """
+    global _next_worker_num
+
     if not os.path.exists(_REGISTRY_FILE):
         return
     try:
         with open(_REGISTRY_FILE, encoding="utf-8") as f:
             data: dict = json.load(f)
         with _workers_lock:
+            max_num = 0
             for worker_id, url in data.items():
                 _workers[worker_id] = url
+                _url_to_id[url] = worker_id
                 if worker_id not in circuit_breakers:
                     circuit_breakers[worker_id] = CircuitBreaker(
                         name=worker_id,
                         fail_max=config.FAIL_MAX,
                         reset_timeout=config.RESET_TIMEOUT,
                     )
+                # Extraer el número del worker_id (ej. "worker_03" → 3)
+                if worker_id.startswith("worker_"):
+                    try:
+                        num = int(worker_id.split("_", 1)[1])
+                        max_num = max(max_num, num)
+                    except ValueError:
+                        pass
+            _next_worker_num = max_num + 1
         logger.info(f"Registro cargado desde disco: {list(data.keys())}")
     except (OSError, json.JSONDecodeError) as e:
         logger.warning(f"No se pudo cargar registro: {e}")
@@ -235,22 +255,35 @@ def register():
     """
     Registra un worker en el pool dinámico y persiste el registro a disco.
 
+    El Ambassador asigna el worker_id centralmente (worker_01, worker_02, ...),
+    evitando colisiones. Si la misma URL ya está registrada, devuelve el ID
+    existente (re-registro).
+
     Body esperado (JSON):
-        worker_id (str): Identificador único del worker (ej. "worker_1").
-        url       (str): URL base accesible del worker (ej. "http://148.x.x.x:5001").
+        url (str): URL base accesible del worker (ej. "http://148.x.x.x:5001").
     """
+    global _next_worker_num
+
     datos = request.get_json(silent=True)
     if not datos:
         return jsonify({"status": "error", "reason": "JSON inválido"}), 400
 
-    worker_id = datos.get("worker_id")
-    url       = datos.get("url")
-
-    if not worker_id or not url:
-        return jsonify({"status": "error", "reason": "faltan worker_id o url"}), 400
+    url = datos.get("url")
+    if not url:
+        return jsonify({"status": "error", "reason": "falta campo 'url'"}), 400
 
     with _workers_lock:
-        es_reregistro = worker_id in _workers
+        # Si esta URL ya tiene un ID asignado → re-registro
+        if url in _url_to_id:
+            worker_id = _url_to_id[url]
+            es_reregistro = True
+        else:
+            # Asignar nuevo ID autoincremental
+            worker_id = f"worker_{_next_worker_num:02d}"
+            _next_worker_num += 1
+            _url_to_id[url] = worker_id
+            es_reregistro = False
+
         _workers[worker_id] = url
 
         # Si el worker ya existía con el CB abierto (p. ej. se cayó y volvió),
@@ -284,7 +317,8 @@ def deregister(worker_id: str):
     with _workers_lock:
         if worker_id not in _workers:
             return jsonify({"status": "error", "reason": f"{worker_id} no está registrado"}), 404
-        del _workers[worker_id]
+        url = _workers.pop(worker_id)
+        _url_to_id.pop(url, None)
         circuit_breakers.pop(worker_id, None)
         total = len(_workers)
 
