@@ -225,10 +225,11 @@
             <th>Worker ID</th>
             <th>Estado (CB)</th>
             <th>Fallos consecutivos</th>
+            <th>Actividad</th>
           </tr>
         </thead>
         <tbody id="workerBody">
-          <tr><td colspan="3" style="color:var(--text-dim);">Cargando...</td></tr>
+          <tr><td colspan="4" style="color:var(--text-dim);">Cargando...</td></tr>
         </tbody>
       </table>
     </div>
@@ -360,28 +361,29 @@ function renderStatus(data) {
 
   // Workers
   const workers = data.workers || {};
-  const breakers = workers.circuit_breakers || {};
+  const detalle = workers.detalle || {};
   const registered = workers.registered || [];
-  const wkeys = Object.keys(breakers);
+  const ocupados = workers.ocupados || [];
+  const wkeys = Object.keys(detalle);
 
-  let activeCount = 0, busyCount = 0;
+  let activeCount = 0;
   wkeys.forEach(k => {
-    if (breakers[k].state !== 'OPEN') activeCount++;
-    if (breakers[k].state === 'CLOSED') busyCount++;
+    if (detalle[k].state !== 'OPEN') activeCount++;
   });
 
   $('workerSummary').textContent =
     'Registrados: ' + registered.length +
-    ' | Con circuit breaker: ' + wkeys.length +
-    ' | Activos (no OPEN): ' + activeCount;
+    ' | Activos (CB cerrado): ' + activeCount +
+    ' | Ocupados: ' + ocupados.length;
 
   const tbody = $('workerBody');
-  if (wkeys.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-dim);">Sin workers registrados.</td></tr>';
+  if (registered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-dim);">Sin workers registrados.</td></tr>';
   } else {
-    tbody.innerHTML = wkeys.map(wid => {
-      const cb = breakers[wid];
+    tbody.innerHTML = registered.map(wid => {
+      const cb = detalle[wid] || {};
       const st = cb.state || '?';
+      const busy = ocupados.includes(wid);
       let cls = 'cb-closed';
       if (st === 'OPEN') cls = 'cb-open';
       else if (st === 'HALF_OPEN') cls = 'cb-half';
@@ -389,6 +391,7 @@ function renderStatus(data) {
         '<td>' + wid + '</td>' +
         '<td class="' + cls + '">' + st + '</td>' +
         '<td>' + (cb.fail_count ?? '—') + '</td>' +
+        '<td>' + (busy ? '⏳ Procesando' : '✅ Libre') + '</td>' +
         '</tr>';
     }).join('');
   }
