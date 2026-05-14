@@ -15,8 +15,8 @@ import re
 import os
 from collections import Counter
 
-# Mismo patrón exacto usado en los workers
-PATRON_PALABRAS = re.compile(r"\b[a-záéíóúüñ]+\b")
+# Mismo patrón exacto usado en los workers y el coordinator
+PATRON_PALABRAS = re.compile(r"\b\w+\b")
 
 # Ruta por defecto (la misma que usa el worker si se corre local)
 WIKI_PATH = os.getenv("WIKI_PATH", "wiki_es.txt")
@@ -38,7 +38,7 @@ def main():
     # Leemos línea por línea para no cargar los 5GB en la memoria RAM.
     # errors="replace" para evitar crashes por caracteres malformados, igual que el worker.
     try:
-        with open(WIKI_PATH, "r", encoding="utf-8", errors="replace") as f:
+        with open(WIKI_PATH, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 # Normalizamos y extraemos palabras
                 palabras = PATRON_PALABRAS.findall(line.lower())

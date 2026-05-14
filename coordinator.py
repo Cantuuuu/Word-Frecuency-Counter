@@ -241,7 +241,8 @@ def status():
     try:
         r       = requests.get(f"{AMBASSADOR_URL}/workers/status", timeout=5)
         workers = r.json() if r.status_code == 200 else {}
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ambassador no disponible en /status: {e}")
         workers = {}
 
     with _lock:
@@ -327,6 +328,16 @@ def start():
         if _state == "running":
             return jsonify({"status": "error", "reason": "ya está corriendo"}), 409
         _state = "running"
+
+    # Validar archivo antes de lanzar el hilo — error inmediato, no asíncrono
+    if not os.path.isfile(FILE_PATH):
+        with _lock:
+            _state = "idle"
+        return jsonify({"status": "error", "reason": f"archivo no encontrado: {FILE_PATH}"}), 500
+    if os.path.getsize(FILE_PATH) == 0:
+        with _lock:
+            _state = "idle"
+        return jsonify({"status": "error", "reason": f"archivo vacío: {FILE_PATH}"}), 500
 
     try:
         workers = _get_workers()

@@ -346,7 +346,11 @@ def dispatch():
                 "status": "error", "reason": "no_workers_available",
             }), 503
 
-        cb = circuit_breakers[worker_id]
+        cb = circuit_breakers.get(worker_id)
+        if cb is None:
+            logger.warning(f"Worker {worker_id} desapareció entre selección y despacho — reintentando")
+            ya_fallaron.add(worker_id)
+            continue
         logger.info(f"Worker seleccionado : {worker_id}")
         logger.info(f"Estado CB {worker_id:<12}: {cb.state.value}")
         logger.info(f"Intento             : {intento} / {max_retries}")
