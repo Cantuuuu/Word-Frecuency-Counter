@@ -1,30 +1,67 @@
 # Distributed Word-Frequency Counter
 
-Un sistema distribuido para contar la frecuencia de palabras en archivos de texto masivos (Wikipedia en español, 5.2 GB) utilizando una arquitectura de microservicios con balanceo de carga, tolerancia a fallos y reintentos automaticos.
+Sistema distribuido para contar la frecuencia de palabras en archivos de texto masivos (Wikipedia en espanol, 5.2 GB) utilizando una arquitectura de microservicios con registro dinamico de workers, balanceo de carga, Circuit Breaker, tolerancia a fallos y reintentos automaticos.
 
 ## Arquitectura del Sistema
 
-El sistema distribuye el procesamiento en multiples computadoras (nodos), evitando enviar el archivo pesado por red. Solo se transmiten metadatos (rangos de bytes y diccionarios de frecuencia en JSON).
+El sistema distribuye el procesamiento en multiples computadoras (nodos). Cada nodo tiene su propia copia local del archivo — solo se transmiten metadatos (rangos de bytes) y diccionarios de frecuencia (JSON) por red.
 
 | Componente | Puerto | Responsabilidad |
 |------------|--------|-----------------|
-| **Coordinator** | 4999 | Divide el archivo en chunks (rangos de bytes), los despacha en paralelo al Ambassador y combina los resultados. |
-| **Ambassador** | 5005 | Proxy inteligente: balancea carga con Round-Robin, gestiona Circuit Breakers por worker y aplica politica de reintentos con rotacion. |
-| **Workers** (x3) | 5001 | Servidores Flask que reciben un rango de bytes, leen su copia local del archivo, extraen palabras con regex y retornan el conteo. |
+| **Coordinator** | 4999 | Divide el archivo en chunks (rangos de bytes), los despacha en paralelo al Ambassador, combina resultados. Maneja estados: `idle`, `running`, `done`, `partial`, `error`. |
+| **Ambassador** | 5005 | Proxy inteligente: registra workers dinamicamente, balancea carga con Round-Robin, gestiona Circuit Breakers por worker, aplica reintentos con rotacion, anti-doble-asignacion. |
+| **Workers** | 5001 | Servidores Flask que reciben un rango de bytes, leen su copia local del archivo, extraen palabras con regex y retornan el conteo. Se auto-registran con el Ambassador al arrancar. |
 
 ### Flujo de datos
 
 ```
+Worker ──POST /register──> Ambassador          (auto-registro al arrancar)
+
 Coordinator ──POST /dispatch──> Ambassador ──POST /count──> Worker
-                                    │                         │
-                                    │   (Round-Robin +        │  seek(start)
-                                    │    Circuit Breaker)     │  read(end - start)
-                                    │                         │  regex + Counter
-                                    │                         │
+                                    |                         |
+                                    |   Round-Robin +         |  seek(start)
+                                    |   Circuit Breaker +     |  read en bloques de 64MB
+                                    |   busy check            |  regex + Counter
+                                    |                         |
                                     <────── JSON {word:count} <
 ```
 
 > **Dato clave:** El archivo `wiki_es.txt` reside localmente en cada nodo. El sistema solo intercambia offsets de inicio/fin y diccionarios JSON por red.
+
+---
+
+## Endpoints
+
+### Coordinator (:4999)
+
+| Metodo | Ruta | Descripcion |
+|--------|------|-------------|
+| `POST` | `/start` | Arranca el procesamiento. Body opcional: `{"retries": N, "ground_truth": false}`. Hace health check de workers antes de despachar. |
+| `GET` | `/status` | Estado actual: workers, chunks en proceso, chunks lentos (>60s). |
+| `GET` | `/result` | Resultado del ultimo procesamiento e historial (ultimas 5 ejecuciones). |
+| `POST` | `/reset` | Vuelve a `idle` desde `done`/`partial`/`error`. Limpia resultado y counter acumulado. |
+| `POST` | `/retry-failed` | Re-despacha solo los chunks fallidos y fusiona con el counter existente. Solo desde estado `partial`. |
+
+### Ambassador (:5005)
+
+| Metodo | Ruta | Descripcion |
+|--------|------|-------------|
+| `POST` | `/register` | Registra un worker. Body: `{"worker_id": "...", "url": "..."}`. Resetea CB si el worker se re-registra con circuito abierto. |
+| `DELETE` | `/workers/<worker_id>` | Da de baja un worker manualmente. |
+| `POST` | `/dispatch` | Recibe un chunk del Coordinator y lo despacha a un worker disponible con reintentos. |
+| `GET` | `/workers/status` | Estado del pool: workers registrados, activos, ocupados, estado de cada CB. |
+| `GET` | `/workers/health` | Health check paralelo de todos los workers (timeout 3s cada uno). |
+| `POST` | `/workers/reset-cbs` | Resetea todos los Circuit Breakers a CLOSED. |
+| `GET` | `/health` | Health check del Ambassador. |
+
+### Worker (:5001)
+
+| Metodo | Ruta | Descripcion |
+|--------|------|-------------|
+| `GET` | `/health` | Estado: uptime, accesibilidad del archivo, URL registrada. |
+| `POST` | `/count` | Procesa rango `[start, end)` y retorna `{word: count, ...}`. |
+
+---
 
 ## Tecnologias
 
@@ -32,14 +69,15 @@ Coordinator ──POST /dispatch──> Ambassador ──POST /count──> Work
 * **Web Framework:** Flask (servidores REST multi-hilo)
 * **Comunicacion HTTP:** Libreria `requests`
 * **Infraestructura:** Docker y Docker Compose
+* **Tolerancia a fallos:** Circuit Breaker (3 estados), reintentos con rotacion, auto-reintento
 
 ---
 
 ## Requisitos Previos
 
 1. [Docker Desktop](https://www.docker.com/products/docker-desktop/) instalado en cada computadora.
-2. El archivo `wiki_es.txt` (5.2 GB) en la raiz del proyecto en **cada** computadora.
-3. Todas las computadoras conectadas a la **misma red WiFi/LAN**.
+2. El archivo `wiki_es.txt` (5.2 GB) en **cada** computadora.
+3. Para modo red: todas las computadoras conectadas a la **misma red WiFi/LAN**.
 
 ---
 
@@ -51,19 +89,27 @@ Para pruebas rapidas sin necesidad de red:
 # 1. Clonar el repositorio
 git clone https://github.com/Cantuuuu/Word-Frecuency-Counter.git
 cd Word-Frecuency-Counter
+git checkout coordinator
 
 # 2. Colocar wiki_es.txt en la raiz del proyecto
 
-# 3. Crear el archivo .env para modo local
-cp .env.example .env
-# Editar .env: descomentar las lineas de "Modo local" y comentar las de "Modo red"
+# 3. Levantar todo (Ambassador + Worker local + Coordinator)
+docker compose up --build
 
-# 4. Levantar todo (Ambassador + Worker local + Coordinator)
-docker-compose up --build
+# 4. Esperar a ver en logs que el worker se registro y el ambassador esta healthy
 
-# 5. Detener
-docker-compose down
+# 5. Lanzar el procesamiento
+curl -X POST http://localhost:4999/start
+
+# 6. Monitorear
+curl http://localhost:4999/status
+curl http://localhost:4999/result
+
+# 7. Detener
+docker compose down
 ```
+
+> El `docker-compose.yml` incluye un `worker_local` que se auto-registra con el Ambassador. No se necesita archivo `.env`.
 
 ---
 
@@ -72,175 +118,253 @@ docker-compose down
 ### Topologia
 
 ```
-  TU PC (Coordinator + Ambassador)
-  ┌─────────────────────────────────┐
-  │  docker-compose up --build      │
-  │  - coordinator :4999            │
-  │  - ambassador  :5005            │
-  └──────────┬──────────────────────┘
-             │  red WiFi/LAN
-     ┌───────┼───────┐
-     │       │       │
-     v       v       v
-  Laptop 1  Laptop 2  Laptop 3
-  Worker 1  Worker 2   Worker 3
-  :5001     :5001      :5001
+  TU PC (Coordinator + Ambassador + Worker local)
+  +---------------------------------------------+
+  |  docker compose up --build                   |
+  |  - ambassador  :5005                         |
+  |  - coordinator :4999                         |
+  |  - worker_local :5001                        |
+  +----------------------+-----------------------+
+                         |  red WiFi/LAN
+                 +-------+-------+
+                 |               |
+                 v               v
+              Laptop A        Laptop B
+              Worker A        Worker B
+              :5002           :5002
 ```
 
-- **Tu PC** corre el Coordinator y el Ambassador (via `docker-compose`).
-- **Cada laptop remota** corre unicamente un Worker (via `docker run`).
-- Cada maquina tiene su propia copia del archivo `wiki_es.txt`.
+Los workers remotos se **auto-registran** con el Ambassador al arrancar. No se necesita configurar IPs de workers en tu PC.
 
 ---
 
-### Paso 1: Preparar cada laptop remota (Workers)
+### Paso 1: Tu PC — levantar los servicios principales
 
-Repetir en cada una de las 3 laptops:
+```bash
+cd Word-Frecuency-Counter
+docker compose up --build
+```
+
+Obtener tu IP local:
+
+**Windows:**
+```
+ipconfig
+# Buscar "Adaptador Wi-Fi" → "Direccion IPv4" (ej. 192.168.1.10)
+```
+
+**macOS:**
+```
+ifconfig en0
+# Buscar "inet" (ej. 192.168.1.10)
+```
+
+---
+
+### Paso 2: Cada laptop remota — levantar el worker
+
+En cada laptop worker:
 
 ```bash
 # 1. Clonar el repositorio
 git clone https://github.com/Cantuuuu/Word-Frecuency-Counter.git
 cd Word-Frecuency-Counter
+git checkout coordinator
 
-# 2. Colocar wiki_es.txt en la raiz del proyecto
-#    (copiar via USB o transferencia en red)
+# 2. Asegurar que wiki_es.txt esta disponible (ej. en C:\wiki_es.txt)
 
-# 3. Construir la imagen del Worker
-docker build -f Dockerfile.worker -t wc-worker .
+# 3. Construir la imagen
+docker build -f Dockerfile.worker -t wordcounter-worker .
 
-# 4. Ejecutar el Worker
-#    Reemplazar WORKER_ID con: worker_1, worker_2 o worker_3
-docker run --rm -p 5001:5001 \
-  -e WORKER_ID=worker_1 \
-  -v "./wiki_es.txt:/app/data/input.txt:ro" \
-  wc-worker
+# 4. Obtener la IP local de esta laptop (ipconfig / ifconfig)
+
+# 5. Ejecutar el worker
+#    Reemplazar:
+#      <IP_TU_PC>       → IP de tu PC (donde corre el Ambassador)
+#      <IP_ESTA_LAPTOP> → IP de esta laptop worker
+#      <RUTA_ARCHIVO>   → Ruta al wiki_es.txt en esta laptop
 ```
 
-> **Verificar que funciona:** Desde la misma laptop, abrir un navegador y visitar `http://localhost:5001/health`. Debe responder `{"status": "ok", ...}`.
+**Windows (PowerShell):**
+```powershell
+docker run --rm `
+  -p 5002:5001 `
+  -e WORKER_ID=worker_laptopX `
+  -e AMBASSADOR_URL=http://<IP_TU_PC>:5005 `
+  -e WORKER_URL=http://<IP_ESTA_LAPTOP>:5002 `
+  -v <RUTA_ARCHIVO>:/app/data/input.txt:ro `
+  wordcounter-worker
+```
+
+**Linux/macOS (bash):**
+```bash
+docker run --rm \
+  -p 5002:5001 \
+  -e WORKER_ID=worker_laptopX \
+  -e AMBASSADOR_URL=http://<IP_TU_PC>:5005 \
+  -e WORKER_URL=http://<IP_ESTA_LAPTOP>:5002 \
+  -v <RUTA_ARCHIVO>:/app/data/input.txt:ro \
+  wordcounter-worker
+```
+
+> Usar un `WORKER_ID` unico por laptop (ej. `worker_laptop2`, `worker_laptop3`).
+> El puerto externo (`-p 5002:5001`) puede variar si hay conflictos.
+
+Si Docker no puede descargar la imagen base (`python:3.11-slim`) por problemas de red, exportar desde tu PC con `docker save wordcounter-worker -o worker_image.tar`, copiar el archivo a la laptop, y cargar con `docker load -i worker_image.tar`.
 
 ---
 
-### Paso 2: Obtener la IP de cada laptop worker
+### Paso 3: Verificar conexion
 
-Cada laptop necesita saber su IP en la red local:
-
-**Windows:**
-```
-ipconfig
-```
-Buscar la seccion del adaptador Wi-Fi y anotar la linea **"IPv4 Address"** (ej. `192.168.1.101`).
-
-**macOS:**
-```
-ifconfig en0
-```
-Buscar la linea **"inet"** (ej. `192.168.1.103`).
-
-**Verificar conectividad** desde tu PC:
-```
-ping 192.168.1.101
-```
-
----
-
-### Paso 3: Configurar tu PC (Coordinator + Ambassador)
+Desde tu PC:
 
 ```bash
-# 1. Ir al directorio del proyecto
-cd Word-Frecuency-Counter
+# Ver workers registrados
+curl http://localhost:5005/workers/status
 
-# 2. Crear el archivo .env con las IPs reales de los workers
-cp .env.example .env
+# Health check de todos los workers
+curl http://localhost:5005/workers/health
 ```
 
-Editar `.env` con las IPs obtenidas en el paso anterior:
-
-```env
-WORKER_1_URL=http://192.168.1.101:5001
-WORKER_2_URL=http://192.168.1.102:5001
-WORKER_3_URL=http://192.168.1.103:5001
-```
-
-```bash
-# 3. Levantar Coordinator + Ambassador
-docker-compose up --build
-```
-
-El Coordinator hara un health check al Ambassador, dividira el archivo en 3 chunks y los despachara en paralelo. Al terminar, imprime las 20 palabras mas frecuentes y el speedup vs. el conteo secuencial.
+Ambos workers deben aparecer con `"reachable": true` y `"file_accessible": true`.
 
 ---
 
-### Solucion de problemas comunes
+### Paso 4: Lanzar el procesamiento
 
-#### El Ambassador no puede conectar con un Worker
+```bash
+# Lanzar con ground truth (compara contra conteo secuencial)
+curl -X POST http://localhost:4999/start
 
-**Causa mas probable: Firewall.** Por defecto, Windows y macOS bloquean conexiones entrantes.
-
-**Windows** — abrir puerto 5001 (ejecutar como Administrador):
+# O sin ground truth (mas rapido, omite conteo secuencial)
+curl -X POST http://localhost:4999/start -H "Content-Type: application/json" -d "{\"ground_truth\": false}"
 ```
-netsh advfirewall firewall add rule name="Worker WordCounter" dir=in action=allow protocol=TCP localport=5001
+
+---
+
+### Paso 5: Monitorear y obtener resultados
+
+```bash
+# Estado en tiempo real (chunks en proceso, chunks lentos)
+curl http://localhost:4999/status
+
+# Resultado final (top 20 palabras, speedup, historial)
+curl http://localhost:4999/result
 ```
 
-Para eliminar la regla despues de la demo:
+---
+
+## Manejo de Fallos
+
+### Si el resultado es `partial` (algunos chunks fallaron)
+
+```bash
+# Ver que chunks fallaron
+curl http://localhost:4999/result
+# → chunks_fallidos: [{chunk_id, inicio, fin, reason}]
+
+# Reintentar solo los chunks fallidos (sin repetir los exitosos)
+curl -X POST http://localhost:4999/retry-failed
+```
+
+### Para volver a ejecutar todo desde cero
+
+```bash
+# 1. Resetear el coordinator
+curl -X POST http://localhost:4999/reset
+
+# 2. Resetear los Circuit Breakers (limpia bloqueos de corridas anteriores)
+curl -X POST http://localhost:5005/workers/reset-cbs
+
+# 3. Lanzar de nuevo
+curl -X POST http://localhost:4999/start
+```
+
+### Si un worker se desconecto y volvio
+
+El worker se re-registra automaticamente al arrancar. El Ambassador resetea su Circuit Breaker a CLOSED al detectar el re-registro.
+
+---
+
+## Solucion de Problemas
+
+### El worker remoto no aparece en /workers/status
+
+**Causa mas probable: Firewall.** Windows bloquea conexiones entrantes por defecto.
+
+**Windows** — abrir el puerto (ejecutar como Administrador):
+```
+netsh advfirewall firewall add rule name="Worker WordCounter" dir=in action=allow protocol=TCP localport=5002
+```
+
+Para eliminar la regla despues:
 ```
 netsh advfirewall firewall delete rule name="Worker WordCounter"
 ```
 
-**macOS** — en Ajustes del Sistema > Red > Firewall: desactivar temporalmente o permitir conexiones entrantes para Docker.
-
-#### Verificar que el Worker es accesible desde tu PC
-
-Desde tu PC, con la IP del worker:
+Tambien abrir el puerto 5005 en tu PC si el worker no puede registrarse:
 ```
-curl http://192.168.1.101:5001/health
+netsh advfirewall firewall add rule name="Ambassador WordCounter" dir=in action=allow protocol=TCP localport=5005
 ```
-Debe responder: `{"status": "ok", "worker_id": "worker_1", ...}`
 
-Si no responde: revisar firewall, verificar que Docker esta corriendo y que el `docker run` sigue activo.
+### /workers/health muestra `reachable: false`
 
-#### Las IPs cambiaron
+- Verificar que la IP usada en `WORKER_URL` es la IP **local de red** (192.168.x.x o 10.x.x.x), no una IP publica ni localhost.
+- Verificar conectividad: `ping <IP_WORKER>` desde tu PC.
+- Verificar que el contenedor esta corriendo: `docker ps` en la laptop worker.
 
-Las IPs asignadas por WiFi son dinamicas. Si una laptop se desconecta y reconecta, puede obtener una IP diferente. Obtener las IPs justo antes de iniciar la demo.
+### /workers/health muestra `file_accessible: false`
 
-#### Error de bind mount en Windows
+El archivo no esta montado correctamente. Verificar:
+- Que `wiki_es.txt` existe en la ruta especificada en `-v`.
+- Que la ruta en `-v` es absoluta (ej. `C:\wiki_es.txt:/app/data/input.txt:ro`).
 
-Si Docker no puede montar `wiki_es.txt`, usar la ruta absoluta completa:
+### Docker no puede descargar `python:3.11-slim`
+
+Red universitaria o VPN bloqueando Docker Hub. Solucion:
 ```bash
-docker run --rm -p 5001:5001 \
-  -e WORKER_ID=worker_1 \
-  -v "C:/Users/tu_usuario/Word-Frecuency-Counter/wiki_es.txt:/app/data/input.txt:ro" \
-  wc-worker
+# En una PC con internet:
+docker save wordcounter-worker -o worker_image.tar
+
+# Copiar worker_image.tar a la laptop (USB, red local, etc.)
+
+# En la laptop sin internet:
+docker load -i worker_image.tar
 ```
+
+### Las IPs cambiaron
+
+Las IPs WiFi son dinamicas. Obtener las IPs justo antes de iniciar. Si una IP cambio, el worker se puede volver a registrar con la nueva IP.
 
 ---
 
-## Pruebas y Validacion
+## Parametros de Configuracion (config.py)
 
-### Test de componentes (Mock del Coordinator)
-Envia dos bloques de prueba para verificar el flujo Ambassador-Worker sin necesidad del Coordinator completo:
+| Parametro | Valor | Descripcion |
+|-----------|-------|-------------|
+| `AMBASSADOR_PORT` | 5005 | Puerto del Ambassador |
+| `FAIL_MAX` | 2 | Fallos consecutivos para abrir el Circuit Breaker |
+| `RESET_TIMEOUT` | 10s | Segundos en OPEN antes de pasar a HALF_OPEN |
+| `MAX_RETRIES` | 2 | Intentos por chunk en el Ambassador (2 = 1 reintento real) |
+| `REQUEST_TIMEOUT` | 600s | Timeout HTTP para cada chunk (10 min) |
+| `BUFFER_SIZE` | 64 MB | Tamano de bloque de lectura en el worker |
+| `BOUNDARY_BUF` | 512 B | Bytes extra para capturar palabras en el limite de chunk |
+
+---
+
+## Pruebas
+
+### Tests unitarios del Circuit Breaker
 ```bash
-python test_components.py
+python -m pytest test_circuit_breaker.py -v
 ```
+23 tests que cubren los 3 estados, transiciones, thread-safety y la interfaz `call()`.
 
-### Ground Truth (Linea base secuencial)
-Calcula el conteo secuencial en un solo hilo para medir el speedup del sistema distribuido:
+### Ground Truth (baseline secuencial)
 ```bash
 python ground_truth.py
 ```
-
----
-
-## Decisiones de Diseño
-
-| Decision | Razon |
-|----------|-------|
-| **Puerto 5005 para el Ambassador** | Evita conflicto con AirPlay Receiver de macOS (que usa el puerto 5000). |
-| **Timeout de 20 segundos** | Permite que workers con discos lentos o virtualizacion Docker completen la lectura del archivo. |
-| **Archivo local en cada nodo** | Evita transferir 5.2 GB por red; solo se intercambian metadatos JSON (KB). |
-| **Bind mount (no COPY)** | El archivo no entra en la imagen Docker; la imagen pesa ~150 MB en vez de 5.3 GB. |
-| **Round-Robin con Circuit Breaker** | Distribuye carga equitativamente y excluye workers caidos sin esperar timeout. |
-| **Reintentos con rotacion** | Si un worker falla, el Ambassador reintenta con otro worker diferente (hasta 3 intentos). |
-| **Flask threaded=True** | Permite que el Ambassador atienda multiples chunks en paralelo sin encolarlos. |
+Conteo secuencial en un solo hilo para comparar con el sistema distribuido.
 
 ---
 
@@ -248,24 +372,44 @@ python ground_truth.py
 
 ```
 WordCounter/
-  ambassador.py            # Servidor Ambassador (proxy + balanceador)
-  circuit_breaker_mock.py  # Implementacion del Circuit Breaker (thread-safe)
-  config.py                # Configuracion centralizada (IPs, puertos, timeouts)
-  coordinator.py           # Orquestador: divide, despacha, combina
-  worker.py                # Servidor Worker (conteo de palabras)
-  docker-compose.yml       # Orquestacion Docker (Ambassador + Worker local + Coordinator)
+  coordinator.py           # Orquestador: divide, despacha, combina, estados
+  ambassador.py            # Proxy: registro dinamico, Round-Robin, Circuit Breaker, reintentos
+  worker.py                # Servidor Worker: conteo de palabras por rango de bytes
+  circuit_breaker.py       # Circuit Breaker thread-safe (CLOSED/OPEN/HALF_OPEN)
+  config.py                # Configuracion centralizada (puertos, timeouts, parametros)
+  docker-compose.yml       # Orquestacion: Ambassador + Worker local + Coordinator
   Dockerfile.ambassador    # Imagen Docker del Ambassador
   Dockerfile.coordinator   # Imagen Docker del Coordinator
   Dockerfile.worker        # Imagen Docker del Worker
-  .env.example             # Plantilla de variables de entorno
-  requierements.txt        # Dependencias Python (flask, requests)
+  requirements.txt         # Dependencias Python (flask, requests)
   ground_truth.py          # Conteo secuencial para benchmark
+  test_circuit_breaker.py  # Tests unitarios del Circuit Breaker (pytest)
   test_components.py       # Tests de integracion mock
+  docs/
+    diagramas.md           # Diagramas Mermaid (arquitectura, secuencia, CB, componentes)
 ```
 
 ---
 
-*Sistemas Distribuidos*
+## Decisiones de Diseno
 
-*Proyecto Final - Word Frequency Counter*
+| Decision | Razon |
+|----------|-------|
+| **Registro dinamico de workers** | Los workers se auto-registran al arrancar. No se necesita configurar IPs manualmente en el Ambassador. |
+| **Puerto 5005 para el Ambassador** | Evita conflicto con AirPlay Receiver de macOS (puerto 5000). |
+| **Timeout de 600 segundos** | Permite que workers con discos lentos o virtualizacion Docker completen chunks de ~1.7 GB. |
+| **Archivo local en cada nodo** | Evita transferir 5.2 GB por red; solo se intercambian metadatos JSON (KB). |
+| **Bind mount (no COPY)** | El archivo no entra en la imagen Docker; la imagen pesa ~150 MB en vez de 5.3 GB. |
+| **Round-Robin con Circuit Breaker** | Distribuye carga equitativamente y excluye workers caidos sin esperar timeout. |
+| **Anti-doble-asignacion (busy set)** | Evita enviar un segundo chunk a un worker que aun no termino el primero. |
+| **Reintentos con rotacion (MAX_RETRIES=2)** | Si un worker falla, el Ambassador reintenta con otro worker diferente. |
+| **Auto-reintento en Coordinator** | Fase 2 automatica: re-despacha chunks que fallaron tras agotar reintentos del Ambassador. |
+| **Estado partial + /retry-failed** | Permite recuperar chunks fallidos sin repetir todo el procesamiento. |
+| **Persistencia del registro** | `workers_registry.json` sobrevive reinicios del Ambassador. |
+| **Health check pre-vuelo** | `POST /start` verifica salud de workers antes de despachar, excluyendo los que no responden. |
+| **Flask threaded=True** | Permite que el Ambassador atienda multiples chunks en paralelo sin encolarlos. |
+| **Lectura en bloques de 64 MB** | Evita OOM al procesar chunks de gigabytes. |
 
+---
+
+*Sistemas Distribuidos — Proyecto Final*
