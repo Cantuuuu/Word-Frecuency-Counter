@@ -11,8 +11,7 @@ Endpoints:
 Estados:
   idle    → sin procesar
   running → procesamiento en curso
-  done    → todos los chunks completados
-  partial → algunos chunks fallaron (resultado incompleto)
+  done    → todos los chunks completados (siempre llega a 100%)
   error   → fallo catastrófico (excepción no esperada)
 
 Variables de entorno:
@@ -171,14 +170,13 @@ def _run_processing(
         t_inicio = time.monotonic()
         resultados: dict[int, dict] = {}
 
-        # Máximo de intentos por chunk (despacho original + reintentos inmediatos)
-        max_intentos = 4
+        RETRY_DELAY = 10  # Segundos de espera antes de reintentar un chunk fallido
         intentos: dict[int, int] = {}
 
-        # --- Despacho con reintento inmediato ---
-        # En lugar de esperar a que TODOS terminen para reintentar,
-        # usamos FIRST_COMPLETED: en cuanto un chunk falla, se
-        # re-despacha al instante aprovechando workers libres.
+        # --- Despacho con reintento persistente ---
+        # Reintenta chunks fallidos indefinidamente hasta que todos
+        # completen. Pausa RETRY_DELAY segundos entre reintentos para
+        # dar tiempo a que los workers se reconecten.
         with ThreadPoolExecutor(max_workers=num_chunks) as pool:
             pendientes: set    = set()
             futuro_a_chunk: dict = {}
@@ -198,44 +196,33 @@ def _run_processing(
 
                     if resp.get("status") == "ok":
                         resultados[cid] = resp
-                    elif intentos[cid] < max_intentos:
+                    else:
                         intentos[cid] += 1
-                        logger.info(
-                            f"Reintento inmediato: chunk_{cid} "
-                            f"(intento {intentos[cid]}/{max_intentos})"
+                        logger.warning(
+                            f"chunk_{cid} falló (intento {intentos[cid] - 1}) "
+                            f"— reintentando en {RETRY_DELAY}s"
                         )
+                        time.sleep(RETRY_DELAY)
                         start, end = chunks[cid]
                         new_f = pool.submit(_enviar_chunk, cid, start, end, max_retries)
                         pendientes.add(new_f)
                         futuro_a_chunk[new_f] = cid
-                    else:
-                        resultados[cid] = resp
 
         t_dist = time.monotonic() - t_inicio
 
-        # --- Contar resultados finales ---
+        # --- Contar resultados finales (todos exitosos por diseño) ---
         total_counter: Counter = Counter()
-        exitosos = 0
-        chunks_fallidos_info: list[dict] = []
 
         for cid, resp in resultados.items():
-            if resp.get("status") == "ok":
-                total_counter.update(resp.get("result", {}))
-                exitosos += 1
-            else:
-                reason = resp.get("reason", "desconocido")
-                logger.warning(f"chunk_{cid} fallido definitivo: {reason}")
-                chunks_fallidos_info.append({
-                    "chunk_id": cid,
-                    "inicio":   chunks[cid][0],
-                    "fin":      chunks[cid][1],
-                    "reason":   reason,
-                })
+            total_counter.update(resp.get("result", {}))
 
-        estado_final = "done" if exitosos == num_chunks else "partial"
+        estado_final = "done"
+        reintentos_totales = sum(v - 1 for v in intentos.values())
 
         logger.info("=" * 60)
-        logger.info(f"Chunks exitosos    : {exitosos} / {num_chunks}  [{estado_final.upper()}]")
+        logger.info(f"Chunks exitosos    : {num_chunks} / {num_chunks}  [DONE]")
+        if reintentos_totales > 0:
+            logger.info(f"Reintentos totales : {reintentos_totales}")
         logger.info(f"Tiempo distribuido : {t_dist:.2f}s")
         logger.info(f"Palabras únicas    : {len(total_counter):,}")
         logger.info("Top 20 palabras:")
@@ -263,23 +250,23 @@ def _run_processing(
             logger.info("Ground truth omitido (ground_truth=false)")
 
         nuevo_resultado = {
-            "exitosos":           exitosos,
+            "exitosos":           num_chunks,
             "num_chunks":         num_chunks,
+            "reintentos_totales": reintentos_totales,
             "tiempo_distribuido": round(t_dist, 2),
             "tiempo_secuencial":  round(t_seq, 2) if t_seq is not None else None,
             "speedup":            round(t_seq / t_dist, 2) if t_seq and t_dist > 0 else None,
             "palabras_unicas":    len(total_counter),
             "top20":              total_counter.most_common(20),
-            "chunks_fallidos":    chunks_fallidos_info,
         }
 
         with _lock:
             _state         = estado_final
             _result        = nuevo_resultado
-            _total_counter = total_counter   # preservar para /retry-failed
+            _total_counter = total_counter
             _history.append({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                **{k: v for k, v in nuevo_resultado.items() if k != "chunks_fallidos"},
+                **nuevo_resultado,
             })
             if len(_history) > MAX_HISTORY:
                 _history.pop(0)
@@ -370,77 +357,10 @@ def reset():
 
 @app.route("/retry-failed", methods=["POST"])
 def retry_failed():
-    """
-    Re-despacha únicamente los chunks que fallaron en la última corrida.
-
-    Útil cuando un worker se cayó y se recuperó: en lugar de repetir todo
-    desde cero, solo procesa el fragmento faltante y fusiona el resultado
-    con los conteos ya calculados.
-
-    Solo opera desde estado 'partial'. Si todos los chunks del reintento
-    tienen éxito, el estado pasa a 'done'; si alguno vuelve a fallar,
-    permanece en 'partial'.
-    """
-    global _state, _result, _total_counter
-
-    with _lock:
-        if _state == "running":
-            return jsonify({"status": "error", "reason": "procesamiento activo — espera a que termine"}), 409
-        if _state != "partial":
-            return jsonify({
-                "status": "error",
-                "reason": f"solo aplica en estado 'partial', estado actual: '{_state}'",
-            }), 409
-        chunks_fallidos = list(_result.get("chunks_fallidos", []))
-        if not chunks_fallidos:
-            return jsonify({"status": "ok", "reason": "no hay chunks fallidos que reintentar"}), 200
-        _state = "running"
-
-    logger.info(f"Reintentando {len(chunks_fallidos)} chunk(s) fallido(s) manualmente")
-
-    nuevos_resultados: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(chunks_fallidos)) as pool:
-        futuros = {
-            pool.submit(_enviar_chunk, c["chunk_id"], c["inicio"], c["fin"]): c["chunk_id"]
-            for c in chunks_fallidos
-        }
-        for futuro in as_completed(futuros):
-            resp = futuro.result()
-            cid  = resp.get("chunk_id", futuros[futuro])
-            nuevos_resultados[cid] = resp
-
-    with _lock:
-        recuperados  = 0
-        aun_fallidos = []
-
-        for chunk_info in chunks_fallidos:
-            cid  = chunk_info["chunk_id"]
-            resp = nuevos_resultados.get(cid, {})
-            if resp.get("status") == "ok":
-                _total_counter.update(resp.get("result", {}))
-                recuperados += 1
-            else:
-                aun_fallidos.append({
-                    **chunk_info,
-                    "reason": resp.get("reason", "desconocido"),
-                })
-
-        nuevo_exitosos = _result["exitosos"] + recuperados
-        _result.update({
-            "exitosos":        nuevo_exitosos,
-            "palabras_unicas": len(_total_counter),
-            "top20":           _total_counter.most_common(20),
-            "chunks_fallidos": aun_fallidos,
-        })
-        _state = "done" if nuevo_exitosos == _result["num_chunks"] else "partial"
-        estado_final = _state
-
-    logger.info(f"Retry: {recuperados}/{len(chunks_fallidos)} recuperados → estado: {estado_final}")
+    """Obsoleto — el sistema ahora reintenta indefinidamente hasta completar."""
     return jsonify({
-        "status":       "ok",
-        "recuperados":  recuperados,
-        "aun_fallidos": len(aun_fallidos),
-        "estado":       estado_final,
+        "status": "info",
+        "reason": "ya no es necesario: el sistema reintenta chunks fallidos hasta completar al 100%",
     })
 
 
@@ -546,5 +466,5 @@ if __name__ == "__main__":
     logger.info(f"  GET  http://localhost:{PORT}/result        → ver resultado e historial")
     logger.info(f'  POST http://localhost:{PORT}/start         → arrancar  [{{"retries": N, "ground_truth": false}}]')
     logger.info(f"  POST http://localhost:{PORT}/reset         → volver a idle")
-    logger.info(f"  POST http://localhost:{PORT}/retry-failed  → re-procesar chunks fallidos")
+    logger.info(f"  POST http://localhost:{PORT}/retry-failed  → (obsoleto, reintentos ahora son automáticos)")
     app.run(host="0.0.0.0", port=PORT)
