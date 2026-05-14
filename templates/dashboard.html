@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Word Frequency Counter — Dashboard</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface2: #0f3460;
+    --accent: #e94560;
+    --text: #eee;
+    --text-dim: #999;
+    --green: #27ae60;
+    --red: #e74c3c;
+    --yellow: #f39c12;
+    --blue: #2980b9;
+    --radius: 8px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 0 0 40px;
+  }
+
+  header {
+    background: var(--surface);
+    border-bottom: 2px solid var(--accent);
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  header h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  header h1 span { color: var(--accent); }
+
+  .actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    border: none;
+    padding: 10px 20px;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+    color: #fff;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-green  { background: var(--green); }
+  .btn-blue   { background: var(--blue); }
+  .btn-red    { background: var(--red); }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+
+  .toast {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    padding: 12px 20px;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    font-weight: 500;
+    z-index: 999;
+    opacity: 0;
+    transform: translateY(-10px);
+    transition: opacity 0.3s, transform 0.3s;
+    max-width: 400px;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.ok   { background: var(--green); color: #fff; }
+  .toast.err  { background: var(--red); color: #fff; }
+
+  .card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .card h2 {
+    font-size: 1rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .badge-idle    { background: #555; color: #ccc; }
+  .badge-running { background: var(--blue); color: #fff; }
+  .badge-done    { background: var(--green); color: #fff; }
+  .badge-error   { background: var(--red); color: #fff; }
+  .badge-partial { background: var(--yellow); color: #222; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+  }
+
+  .stat-box {
+    background: var(--surface2);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    text-align: center;
+  }
+  .stat-box .label { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 4px; }
+  .stat-box .value {
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 1.3rem;
+    font-weight: 700;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.85rem;
+  }
+  th, td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  th {
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .cb-closed   { color: var(--green); font-weight: 700; }
+  .cb-open     { color: var(--red); font-weight: 700; }
+  .cb-half     { color: var(--yellow); font-weight: 700; }
+
+  .warning-box {
+    background: rgba(243,156,18,0.15);
+    border-left: 4px solid var(--yellow);
+    padding: 10px 16px;
+    border-radius: 0 var(--radius) var(--radius) 0;
+    margin-top: 10px;
+    font-size: 0.85rem;
+  }
+
+  .hidden { display: none; }
+
+  .spin {
+    display: inline-block;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 600px) {
+    header { padding: 14px 16px; }
+    .container { padding: 16px 12px; }
+    .card { padding: 14px 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Word Frequency Counter <span>— Dashboard</span></h1>
+  <div class="actions">
+    <button class="btn btn-green" id="btnStart" onclick="doStart(true)">Iniciar</button>
+    <button class="btn btn-blue"  id="btnStartNoGT" onclick="doStart(false)">Iniciar sin Ground Truth</button>
+    <button class="btn btn-red"   id="btnReset" onclick="doReset()">Reset</button>
+  </div>
+</header>
+
+<div id="toast" class="toast"></div>
+
+<div class="container">
+
+  <!-- Estado -->
+  <div class="card">
+    <h2>Estado del sistema</h2>
+    <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+      <span id="estadoBadge" class="badge badge-idle">idle</span>
+      <span style="color:var(--text-dim); font-size:0.85rem;">
+        Chunks en proceso: <strong id="chunksEnProceso" style="color:var(--text);">0</strong>
+      </span>
+    </div>
+    <div id="slowWarning" class="warning-box hidden" style="margin-top:12px;"></div>
+  </div>
+
+  <!-- Workers -->
+  <div class="card">
+    <h2>Workers</h2>
+    <div id="workerSummary" style="font-size:0.85rem; color:var(--text-dim); margin-bottom:10px;"></div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Worker ID</th>
+            <th>Estado (CB)</th>
+            <th>Fallos consecutivos</th>
+          </tr>
+        </thead>
+        <tbody id="workerBody">
+          <tr><td colspan="3" style="color:var(--text-dim);">Cargando...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Resultados -->
+  <div class="card" id="resultCard" class="hidden">
+    <h2>Resultados</h2>
+    <div id="resultContent">
+      <p style="color:var(--text-dim);">No hay resultados disponibles.</p>
+    </div>
+  </div>
+
+  <!-- Historial -->
+  <div class="card">
+    <h2>Historial de ejecuciones</h2>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Fecha</th>
+            <th>Chunks</th>
+            <th>Exitosos</th>
+            <th>Reintentos</th>
+            <th>T. Distribuido</th>
+            <th>T. Secuencial</th>
+            <th>Speedup</th>
+            <th>Palabras</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr><td colspan="8" style="color:var(--text-dim);">Sin historial.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ---- Toast ---- */
+let toastTimer;
+function toast(msg, ok) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = 'toast ' + (ok ? 'ok' : 'err') + ' show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+/* ---- Formato ---- */
+function fmt(n) {
+  if (n == null) return '—';
+  return Number(n).toLocaleString('es-MX');
+}
+function fmtTime(s) {
+  if (s == null) return '—';
+  return s.toFixed(2) + ' s';
+}
+
+/* ---- Acciones ---- */
+async function doStart(groundTruth) {
+  const btn = groundTruth ? $('btnStart') : $('btnStartNoGT');
+  btn.disabled = true;
+  btn.textContent = 'Enviando...';
+  try {
+    const body = groundTruth ? {} : { ground_truth: false };
+    const r = await fetch('/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      toast('Procesamiento iniciado con ' + j.num_chunks + ' worker(s)', true);
+    } else {
+      toast('Error: ' + (j.reason || r.statusText), false);
+    }
+  } catch (e) {
+    toast('No se pudo conectar al coordinator', false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = groundTruth ? 'Iniciar' : 'Iniciar sin Ground Truth';
+  }
+}
+
+async function doReset() {
+  if (!confirm('¿Resetear el estado del coordinator a idle?')) return;
+  const btn = $('btnReset');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/reset', { method: 'POST' });
+    const j = await r.json();
+    if (r.ok) {
+      toast('Estado reseteado a idle', true);
+      refresh();
+    } else {
+      toast('Error: ' + (j.reason || r.statusText), false);
+    }
+  } catch (e) {
+    toast('No se pudo conectar al coordinator', false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---- Render Status ---- */
+function renderStatus(data) {
+  // Badge
+  const badge = $('estadoBadge');
+  const estado = data.estado || 'idle';
+  badge.textContent = estado;
+  badge.className = 'badge badge-' + estado;
+
+  // Chunks en proceso
+  $('chunksEnProceso').textContent = data.chunks_en_proceso ?? 0;
+
+  // Slow chunks
+  const sw = $('slowWarning');
+  if (data.chunks_lentos && data.chunks_lentos.length > 0) {
+    sw.classList.remove('hidden');
+    sw.innerHTML = '<strong>Chunks lentos:</strong> ' +
+      data.chunks_lentos.map(c => 'chunk_' + c.chunk_id + ' (' + c.segundos + 's)').join(', ');
+  } else {
+    sw.classList.add('hidden');
+  }
+
+  // Workers
+  const workers = data.workers || {};
+  const breakers = workers.circuit_breakers || {};
+  const registered = workers.registered || [];
+  const wkeys = Object.keys(breakers);
+
+  let activeCount = 0, busyCount = 0;
+  wkeys.forEach(k => {
+    if (breakers[k].state !== 'OPEN') activeCount++;
+    if (breakers[k].state === 'CLOSED') busyCount++;
+  });
+
+  $('workerSummary').textContent =
+    'Registrados: ' + registered.length +
+    ' | Con circuit breaker: ' + wkeys.length +
+    ' | Activos (no OPEN): ' + activeCount;
+
+  const tbody = $('workerBody');
+  if (wkeys.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-dim);">Sin workers registrados.</td></tr>';
+  } else {
+    tbody.innerHTML = wkeys.map(wid => {
+      const cb = breakers[wid];
+      const st = cb.state || '?';
+      let cls = 'cb-closed';
+      if (st === 'OPEN') cls = 'cb-open';
+      else if (st === 'HALF_OPEN') cls = 'cb-half';
+      return '<tr>' +
+        '<td>' + wid + '</td>' +
+        '<td class="' + cls + '">' + st + '</td>' +
+        '<td>' + (cb.fail_count ?? '—') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  // Results
+  renderResult(data.result, estado);
+}
+
+function renderResult(result, estado) {
+  const card = $('resultCard');
+  const content = $('resultContent');
+
+  if (!result || Object.keys(result).length === 0 || estado === 'idle') {
+    card.style.display = '';
+    content.innerHTML = '<p style="color:var(--text-dim);">No hay resultados disponibles.</p>';
+    return;
+  }
+
+  if (estado === 'error') {
+    card.style.display = '';
+    content.innerHTML = '<p style="color:var(--red);">Error: ' + (result.reason || 'desconocido') + '</p>';
+    return;
+  }
+
+  if (estado === 'running' && !result.exitosos) {
+    card.style.display = '';
+    content.innerHTML = '<p style="color:var(--text-dim);">Procesamiento en curso...</p>';
+    return;
+  }
+
+  card.style.display = '';
+
+  let html = '<div class="stat-grid">';
+  html += statBox('Exitosos', result.exitosos + ' / ' + result.num_chunks);
+  html += statBox('Reintentos', fmt(result.reintentos_totales));
+  html += statBox('T. Distribuido', fmtTime(result.tiempo_distribuido));
+  html += statBox('T. Secuencial', result.tiempo_secuencial != null ? fmtTime(result.tiempo_secuencial) : '—');
+  html += statBox('Speedup', result.speedup != null ? result.speedup + 'x' : '—');
+  html += statBox('Palabras unicas', fmt(result.palabras_unicas));
+  html += '</div>';
+
+  // Top 20
+  if (result.top20 && result.top20.length > 0) {
+    html += '<h3 style="margin:18px 0 8px; font-size:0.9rem; color:var(--text-dim);">Top 20 palabras</h3>';
+    html += '<div style="overflow-x:auto;"><table><thead><tr><th>#</th><th>Palabra</th><th style="text-align:right;">Conteo</th></tr></thead><tbody>';
+    result.top20.forEach((item, i) => {
+      const word = Array.isArray(item) ? item[0] : item.word;
+      const count = Array.isArray(item) ? item[1] : item.count;
+      html += '<tr><td>' + (i + 1) + '</td><td>' + word + '</td><td style="text-align:right;">' + fmt(count) + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  content.innerHTML = html;
+}
+
+function statBox(label, value) {
+  return '<div class="stat-box"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>';
+}
+
+/* ---- Render History ---- */
+function renderHistory(historial) {
+  const tbody = $('historyBody');
+  if (!historial || historial.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-dim);">Sin historial.</td></tr>';
+    return;
+  }
+  // Most recent first
+  const rows = [...historial].reverse();
+  tbody.innerHTML = rows.map(h => {
+    return '<tr>' +
+      '<td>' + (h.timestamp || '—') + '</td>' +
+      '<td>' + (h.num_chunks ?? '—') + '</td>' +
+      '<td>' + (h.exitosos ?? '—') + '</td>' +
+      '<td>' + (h.reintentos_totales ?? '—') + '</td>' +
+      '<td>' + fmtTime(h.tiempo_distribuido) + '</td>' +
+      '<td>' + (h.tiempo_secuencial != null ? fmtTime(h.tiempo_secuencial) : '—') + '</td>' +
+      '<td>' + (h.speedup != null ? h.speedup + 'x' : '—') + '</td>' +
+      '<td>' + fmt(h.palabras_unicas) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* ---- Refresh Loop ---- */
+async function refresh() {
+  try {
+    const [statusRes, resultRes] = await Promise.all([
+      fetch('/status'),
+      fetch('/result'),
+    ]);
+    const statusData = await statusRes.json();
+    const resultData = await resultRes.json();
+    renderStatus(statusData);
+    renderHistory(resultData.historial);
+  } catch (e) {
+    $('estadoBadge').textContent = 'sin conexion';
+    $('estadoBadge').className = 'badge badge-error';
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+
+</body>
+</html>

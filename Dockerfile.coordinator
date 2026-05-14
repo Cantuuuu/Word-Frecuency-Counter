@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY coordinator.py config.py ./
+COPY templates/ templates/
 
 EXPOSE 4999
 

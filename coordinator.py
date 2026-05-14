@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from datetime import datetime
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 import config
 
@@ -281,6 +281,11 @@ def _run_processing(
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@app.route("/")
+def dashboard():
+    return render_template("dashboard.html")
+
 
 @app.route("/status", methods=["GET"])
 def status():
