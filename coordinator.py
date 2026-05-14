@@ -26,7 +26,7 @@ import re
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 
 import requests
@@ -171,30 +171,45 @@ def _run_processing(
         t_inicio = time.monotonic()
         resultados: dict[int, dict] = {}
 
-        # --- Fase 1: despachar todos los chunks en paralelo ---
-        with ThreadPoolExecutor(max_workers=num_chunks) as pool:
-            futuros = {
-                pool.submit(_enviar_chunk, i, start, end, max_retries): i
-                for i, (start, end) in enumerate(chunks)
-            }
-            for futuro in as_completed(futuros):
-                resp = futuro.result()
-                cid  = resp.get("chunk_id", futuros[futuro])
-                resultados[cid] = resp
+        # Máximo de intentos por chunk (despacho original + reintentos inmediatos)
+        max_intentos = 2
+        intentos: dict[int, int] = {}
 
-        # --- Fase 2: auto-reintento de chunks fallidos (B1) ---
-        fallidos_ids = [cid for cid, r in resultados.items() if r.get("status") != "ok"]
-        if fallidos_ids:
-            logger.info(f"Auto-reintento: {len(fallidos_ids)} chunk(s) fallido(s) → reintentando")
-            with ThreadPoolExecutor(max_workers=len(fallidos_ids)) as pool:
-                futuros_retry = {
-                    pool.submit(_enviar_chunk, cid, chunks[cid][0], chunks[cid][1], max_retries): cid
-                    for cid in fallidos_ids
-                }
-                for futuro in as_completed(futuros_retry):
+        # --- Despacho con reintento inmediato ---
+        # En lugar de esperar a que TODOS terminen para reintentar,
+        # usamos FIRST_COMPLETED: en cuanto un chunk falla, se
+        # re-despacha al instante aprovechando workers libres.
+        with ThreadPoolExecutor(max_workers=num_chunks) as pool:
+            pendientes: set    = set()
+            futuro_a_chunk: dict = {}
+
+            for i, (start, end) in enumerate(chunks):
+                f = pool.submit(_enviar_chunk, i, start, end, max_retries)
+                pendientes.add(f)
+                futuro_a_chunk[f] = i
+                intentos[i] = 1
+
+            while pendientes:
+                completados, pendientes = wait(pendientes, return_when=FIRST_COMPLETED)
+
+                for futuro in completados:
+                    cid  = futuro_a_chunk.pop(futuro)
                     resp = futuro.result()
-                    cid  = resp.get("chunk_id", futuros_retry[futuro])
-                    resultados[cid] = resp   # sobreescribe con el resultado del reintento
+
+                    if resp.get("status") == "ok":
+                        resultados[cid] = resp
+                    elif intentos[cid] < max_intentos:
+                        intentos[cid] += 1
+                        logger.info(
+                            f"Reintento inmediato: chunk_{cid} "
+                            f"(intento {intentos[cid]}/{max_intentos})"
+                        )
+                        start, end = chunks[cid]
+                        new_f = pool.submit(_enviar_chunk, cid, start, end, max_retries)
+                        pendientes.add(new_f)
+                        futuro_a_chunk[new_f] = cid
+                    else:
+                        resultados[cid] = resp
 
         t_dist = time.monotonic() - t_inicio
 
