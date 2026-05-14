@@ -4,11 +4,11 @@ WORKDIR /app
 
 # Instalar dependencias primero para aprovechar la caché de capas de Docker.
 # Si solo cambia el código fuente, esta capa no se reconstruye.
-COPY requierements.txt .
-RUN pip install --no-cache-dir -r requierements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar solo los archivos necesarios para el Ambassador
-COPY ambassador.py config.py circuit_breaker_mock.py ./
+COPY ambassador.py config.py circuit_breaker.py ./
 
 EXPOSE 5005
 

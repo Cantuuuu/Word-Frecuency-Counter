@@ -3,15 +3,15 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Instalar dependencias antes de copiar el código fuente
-COPY requierements.txt .
-RUN pip install --no-cache-dir -r requierements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar solo el servidor del worker
-COPY worker.py ./
+# Copiar worker y configuración centralizada
+COPY worker.py config.py ./
 
 # El archivo wiki_es.txt (5GB) NO se copia a la imagen.
 # Se monta en runtime con bind mount:
-#   docker run -v /ruta/local/wiki_es.txt:/app/wiki_es.txt:ro ...
+#   docker run -v /ruta/local/wiki_es.txt:/app/data/input.txt:ro ...
 # Esto evita que la imagen pese gigabytes y garantiza que cada laptop
 # lea su propia copia local del archivo.
 

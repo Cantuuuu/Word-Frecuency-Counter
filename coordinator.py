@@ -2,14 +2,16 @@
 coordinator.py — Servidor Flask que espera la orden manual de inicio.
 
 Endpoints:
-  GET  /status   → muestra workers registrados y estado actual
-  POST /start    → arranca el procesamiento con los workers que haya
+  GET  /status  → workers registrados, estado actual y chunks lentos en curso
+  GET  /result  → resultado del último procesamiento e historial de ejecuciones
+  POST /start   → arranca el procesamiento (acepta {"retries": N} opcional)
 
 Variables de entorno:
   FILE_PATH      = "/app/wiki_es.txt"
   AMBASSADOR_URL = "http://localhost:5005"
 """
 
+import logging
 import os
 import re
 import threading
@@ -19,17 +21,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+
+import config
 
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
 
-FILE_PATH      = os.getenv("FILE_PATH",      "/app/wiki_es.txt")
+FILE_PATH      = os.getenv("FILE_PATH",      config.WIKI_PATH)
 AMBASSADOR_URL = os.getenv("AMBASSADOR_URL", "http://localhost:5005")
 PORT           = int(os.getenv("PORT", "4999"))
 
-REQUEST_TIMEOUT = 600
+SLOW_THRESHOLD = 60   # Segundos antes de marcar un chunk como "lento" en /status
+MAX_HISTORY    = 5    # Número de ejecuciones guardadas en el historial
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[COORD %(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -38,21 +54,19 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 _state  = "idle"   # idle | running | done | error
-_result = {}
+_result: dict = {}
 _lock   = threading.Lock()
 
+# Tiempos de inicio por chunk — para detectar chunks lentos en /status
+_chunk_times: dict[int, float] = {}
+_chunk_times_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-def _log(msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[COORD {ts}] {msg}", flush=True)
+# Historial de las últimas MAX_HISTORY ejecuciones (protegido por _lock)
+_history: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
-# Consultar workers registrados
+# Consultar workers registrados en el Ambassador
 # ---------------------------------------------------------------------------
 
 def _get_workers() -> list[str]:
@@ -62,7 +76,7 @@ def _get_workers() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Dividir archivo en chunks
+# Dividir archivo en chunks de byte-range iguales
 # ---------------------------------------------------------------------------
 
 def _calcular_chunks(file_path: str, n: int) -> list[tuple[int, int]]:
@@ -73,7 +87,7 @@ def _calcular_chunks(file_path: str, n: int) -> list[tuple[int, int]]:
         start = i * size
         end   = start + size if i < n - 1 else total
         chunks.append((start, end))
-    _log(f"Archivo: {total:,} bytes → {n} chunks de ~{size:,} bytes c/u")
+    logger.info(f"Archivo: {total:,} bytes → {n} chunks de ~{size:,} bytes c/u")
     return chunks
 
 
@@ -81,26 +95,49 @@ def _calcular_chunks(file_path: str, n: int) -> list[tuple[int, int]]:
 # Enviar un chunk al Ambassador
 # ---------------------------------------------------------------------------
 
-def _enviar_chunk(chunk_id: int, inicio: int, fin: int) -> dict:
-    _log(f"Enviando chunk_{chunk_id}: bytes {inicio:,} → {fin:,}")
+def _enviar_chunk(
+    chunk_id: int,
+    inicio: int,
+    fin: int,
+    max_retries: int | None = None,
+) -> dict:
+    """
+    Despacha un chunk al Ambassador y registra su tiempo de inicio para
+    que /status pueda detectar chunks lentos.
+
+    Si max_retries se especifica, se incluye en el payload para que el
+    Ambassador lo use en lugar de su config.MAX_RETRIES por defecto.
+    """
+    logger.info(f"Enviando chunk_{chunk_id}: bytes {inicio:,} → {fin:,}")
+
+    with _chunk_times_lock:
+        _chunk_times[chunk_id] = time.monotonic()
+
+    payload: dict = {"chunk_id": chunk_id, "inicio": inicio, "fin": fin}
+    if max_retries is not None:
+        payload["max_retries"] = max_retries
+
     try:
         r = requests.post(
             f"{AMBASSADOR_URL}/dispatch",
-            json={"chunk_id": chunk_id, "inicio": inicio, "fin": fin},
-            timeout=REQUEST_TIMEOUT,
+            json=payload,
+            timeout=config.REQUEST_TIMEOUT,
         )
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        _log(f"chunk_{chunk_id}: excepción — {e}")
+        logger.error(f"chunk_{chunk_id}: excepción — {e}")
         return {"chunk_id": chunk_id, "worker_id": None, "status": "error", "reason": str(e)}
+    finally:
+        with _chunk_times_lock:
+            _chunk_times.pop(chunk_id, None)
 
 
 # ---------------------------------------------------------------------------
-# Procesamiento distribuido
+# Procesamiento distribuido (corre en hilo daemon)
 # ---------------------------------------------------------------------------
 
-def _run_processing(num_chunks: int) -> None:
+def _run_processing(num_chunks: int, max_retries: int | None = None) -> None:
     global _state, _result
 
     try:
@@ -110,7 +147,7 @@ def _run_processing(num_chunks: int) -> None:
 
         with ThreadPoolExecutor(max_workers=num_chunks) as pool:
             futuros = {
-                pool.submit(_enviar_chunk, i, start, end): i
+                pool.submit(_enviar_chunk, i, start, end, max_retries): i
                 for i, (start, end) in enumerate(chunks)
             }
             for futuro in as_completed(futuros):
@@ -127,46 +164,54 @@ def _run_processing(num_chunks: int) -> None:
                 total_counter.update(resp.get("result", {}))
                 exitosos += 1
             else:
-                _log(f"chunk_{cid} fallido: {resp.get('reason', 'desconocido')}")
+                logger.warning(f"chunk_{cid} fallido: {resp.get('reason', 'desconocido')}")
 
-        _log("=" * 60)
-        _log(f"Chunks exitosos    : {exitosos} / {num_chunks}")
-        _log(f"Tiempo distribuido : {t_dist:.2f}s")
-        _log(f"Palabras únicas    : {len(total_counter):,}")
-        _log("Top 20 palabras:")
+        logger.info("=" * 60)
+        logger.info(f"Chunks exitosos    : {exitosos} / {num_chunks}")
+        logger.info(f"Tiempo distribuido : {t_dist:.2f}s")
+        logger.info(f"Palabras únicas    : {len(total_counter):,}")
+        logger.info("Top 20 palabras:")
         for palabra, cnt in total_counter.most_common(20):
-            _log(f"  {palabra:<20} {cnt:>10,}")
+            logger.info(f"  {palabra:<20} {cnt:>10,}")
 
-        # Ground truth secuencial
-        _log("Iniciando conteo secuencial (ground truth) ...")
-        t0      = time.monotonic()
+        # Ground truth secuencial (para calcular speedup)
+        logger.info("Iniciando conteo secuencial (ground truth) ...")
+        t0          = time.monotonic()
         seq_counter: Counter = Counter()
         with open(FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 seq_counter.update(re.findall(r"\b\w+\b", line.lower()))
         t_seq = time.monotonic() - t0
 
-        _log("=" * 60)
-        _log(f"Tiempo secuencial  : {t_seq:.2f}s")
+        logger.info("=" * 60)
+        logger.info(f"Tiempo secuencial  : {t_seq:.2f}s")
         if t_dist < t_seq:
-            _log(f"Speedup: {t_seq / t_dist:.2f}x más rápido")
+            logger.info(f"Speedup: {t_seq / t_dist:.2f}x más rápido")
         else:
-            _log(f"Speedup: {t_dist / t_seq:.2f}x más lento")
+            logger.info(f"Speedup: {t_dist / t_seq:.2f}x más lento")
+
+        nuevo_resultado = {
+            "exitosos":           exitosos,
+            "num_chunks":         num_chunks,
+            "tiempo_distribuido": round(t_dist, 2),
+            "tiempo_secuencial":  round(t_seq, 2),
+            "speedup":            round(t_seq / t_dist, 2) if t_dist > 0 else None,
+            "palabras_unicas":    len(total_counter),
+            "top20":              total_counter.most_common(20),
+        }
 
         with _lock:
             _state  = "done"
-            _result = {
-                "exitosos":          exitosos,
-                "num_chunks":        num_chunks,
-                "tiempo_distribuido": round(t_dist, 2),
-                "tiempo_secuencial":  round(t_seq, 2),
-                "speedup":            round(t_seq / t_dist, 2) if t_dist > 0 else None,
-                "palabras_unicas":   len(total_counter),
-                "top20":             total_counter.most_common(20),
-            }
+            _result = nuevo_resultado
+            _history.append({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                **nuevo_resultado,
+            })
+            if len(_history) > MAX_HISTORY:
+                _history.pop(0)
 
     except Exception as e:
-        _log(f"Error durante procesamiento: {e}")
+        logger.error(f"Error durante procesamiento: {e}")
         with _lock:
             _state  = "error"
             _result = {"reason": str(e)}
@@ -178,28 +223,69 @@ def _run_processing(num_chunks: int) -> None:
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Muestra workers registrados y estado actual del procesamiento."""
+    """
+    Estado del sistema: workers, estado del procesamiento y chunks lentos.
+
+    Un chunk se marca como 'lento' si lleva más de SLOW_THRESHOLD segundos
+    sin responder — útil para detectar workers colgados sin revisar logs.
+    """
     try:
-        r        = requests.get(f"{AMBASSADOR_URL}/workers/status", timeout=5)
-        workers  = r.json() if r.status_code == 200 else {}
+        r       = requests.get(f"{AMBASSADOR_URL}/workers/status", timeout=5)
+        workers = r.json() if r.status_code == 200 else {}
     except Exception:
-        workers  = {}
+        workers = {}
 
     with _lock:
-        estado  = _state
-        result  = dict(_result)
+        estado = _state
+        result = dict(_result)
+
+    with _chunk_times_lock:
+        now = time.monotonic()
+        chunks_lentos = [
+            {"chunk_id": cid, "segundos": round(now - t, 1)}
+            for cid, t in _chunk_times.items()
+            if now - t > SLOW_THRESHOLD
+        ]
+        chunks_en_proceso = len(_chunk_times)
 
     return jsonify({
-        "estado":   estado,
-        "workers":  workers,
-        "result":   result,
+        "estado":            estado,
+        "chunks_en_proceso": chunks_en_proceso,
+        "chunks_lentos":     chunks_lentos,
+        "workers":           workers,
+        "result":            result,
     })
+
+
+@app.route("/result", methods=["GET"])
+def result():
+    """
+    Resultado del último procesamiento e historial de las últimas ejecuciones.
+
+    Útil para integración con otros sistemas o comparar corridas sin
+    necesidad de revisar los logs manualmente.
+    """
+    with _lock:
+        return jsonify({
+            "estado":    _state,
+            "result":    dict(_result),
+            "historial": list(_history),
+        })
 
 
 @app.route("/start", methods=["POST"])
 def start():
-    """Arranca el procesamiento con los workers registrados en este momento."""
+    """
+    Arranca el procesamiento con los workers registrados en este momento.
+
+    Body opcional (JSON):
+        retries (int): Número máximo de reintentos por chunk en el Ambassador.
+                       Si se omite, el Ambassador usa su config.MAX_RETRIES.
+    """
     global _state
+
+    body        = request.get_json(silent=True) or {}
+    max_retries = body.get("retries")   # None → el Ambassador decide
 
     with _lock:
         if _state == "running":
@@ -219,14 +305,21 @@ def start():
         return jsonify({"status": "error", "reason": "no hay workers registrados"}), 503
 
     num_chunks = len(workers)
-    _log(f"Orden de inicio recibida — {num_chunks} worker(s): {workers}")
+    logger.info(f"Orden de inicio recibida — {num_chunks} worker(s): {workers}")
+    if max_retries is not None:
+        logger.info(f"Reintentos configurados: {max_retries}")
 
-    threading.Thread(target=_run_processing, args=(num_chunks,), daemon=True).start()
+    threading.Thread(
+        target=_run_processing,
+        args=(num_chunks, max_retries),
+        daemon=True,
+    ).start()
 
     return jsonify({
-        "status":     "started",
-        "workers":    workers,
-        "num_chunks": num_chunks,
+        "status":      "started",
+        "workers":     workers,
+        "num_chunks":  num_chunks,
+        "max_retries": max_retries,
     })
 
 
@@ -235,7 +328,8 @@ def start():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _log(f"Coordinator listo en puerto {PORT}")
-    _log(f"  GET  http://localhost:{PORT}/status  → ver workers y estado")
-    _log(f"  POST http://localhost:{PORT}/start   → arrancar procesamiento")
+    logger.info(f"Coordinator listo en puerto {PORT}")
+    logger.info(f"  GET  http://localhost:{PORT}/status  → ver workers y estado")
+    logger.info(f"  GET  http://localhost:{PORT}/result  → ver resultado e historial")
+    logger.info(f"  POST http://localhost:{PORT}/start   → arrancar procesamiento")
     app.run(host="0.0.0.0", port=PORT)

@@ -9,8 +9,6 @@ ajustarlas en el archivo .env el día de la demo según la red WiFi del salón,
 sin necesidad de tocar código fuente.
 """
 
-import os
-
 # ---------------------------------------------------------------------------
 # Ambassador
 # ---------------------------------------------------------------------------
@@ -47,3 +45,10 @@ REQUEST_TIMEOUT = 600  # 10 minutos — necesario para chunks de ~1.7 GB sobre
 
 WIKI_PATH  = "/app/wiki_es.txt"   # Ruta dentro del contenedor Docker
 N_PALABRAS = 3_000_000            # Palabras totales estimadas (para referencia)
+
+# ---------------------------------------------------------------------------
+# Worker — lectura de archivos grandes
+# ---------------------------------------------------------------------------
+
+BUFFER_SIZE  = 64 * 1024 * 1024  # 64 MB por bloque de lectura
+BOUNDARY_BUF = 512                # Bytes extra para capturar palabras en el límite de chunk
