@@ -2,8 +2,10 @@
 ambassador.py — Intermediario entre el Coordinator y los Workers.
 
 Responsabilidades:
-  - Registrar workers dinámicamente (POST /register).
+  - Registrar workers dinámicamente (POST /register); resetea el CB si el worker
+    ya existía con el circuito abierto (worker reiniciado = worker sano).
   - Dar de baja workers manualmente (DELETE /workers/<id>).
+  - Resetear todos los Circuit Breakers (POST /workers/reset-cbs).
   - Recibir chunks del Coordinator (POST /dispatch).
   - Seleccionar un worker disponible mediante Round-Robin Inteligente.
   - Reenviar el chunk al worker seleccionado (POST /count).
@@ -246,17 +248,25 @@ def register():
         return jsonify({"status": "error", "reason": "faltan worker_id o url"}), 400
 
     with _workers_lock:
+        es_reregistro = worker_id in _workers
         _workers[worker_id] = url
-        if worker_id not in circuit_breakers:
+
+        # Si el worker ya existía con el CB abierto (p. ej. se cayó y volvió),
+        # se crea un CB nuevo en CLOSED: el worker acaba de arrancar, está sano.
+        cb_existente = circuit_breakers.get(worker_id)
+        if cb_existente is None or cb_existente.state.value != "CLOSED":
             circuit_breakers[worker_id] = CircuitBreaker(
                 name=worker_id,
                 fail_max=config.FAIL_MAX,
                 reset_timeout=config.RESET_TIMEOUT,
             )
+            if es_reregistro:
+                logger.info(f"CB reseteado        : {worker_id} (re-registro tras fallo)")
         total = len(_workers)
 
     _save_registry()
-    logger.info(f"Worker registrado   : {worker_id} @ {url}  (total: {total})")
+    accion = "re-registrado" if es_reregistro else "registrado"
+    logger.info(f"Worker {accion:<13}: {worker_id} @ {url}  (total: {total})")
     return jsonify({"status": "ok", "worker_id": worker_id, "total_workers": total})
 
 
@@ -365,6 +375,31 @@ def dispatch():
         "chunk_id": chunk_id, "worker_id": None,
         "status": "error", "reason": "max_retries_exceeded",
     }), 502
+
+
+@app.route("/workers/reset-cbs", methods=["POST"])
+def reset_cbs():
+    """
+    Resetea todos los Circuit Breakers a CLOSED.
+
+    Útil para limpiar el estado entre corridas cuando una ejecución anterior
+    dejó workers bloqueados por fallos transitorios (red, timeout puntual, etc.).
+    Llamar antes de POST /start para garantizar que todos los workers participan.
+    """
+    with _workers_lock:
+        worker_ids = list(_workers.keys())
+
+    reseteados = []
+    for worker_id in worker_ids:
+        circuit_breakers[worker_id] = CircuitBreaker(
+            name=worker_id,
+            fail_max=config.FAIL_MAX,
+            reset_timeout=config.RESET_TIMEOUT,
+        )
+        reseteados.append(worker_id)
+
+    logger.info(f"Circuit Breakers reseteados: {reseteados}")
+    return jsonify({"status": "ok", "reseteados": reseteados, "total": len(reseteados)})
 
 
 @app.route("/workers/status", methods=["GET"])

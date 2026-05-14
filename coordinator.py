@@ -4,7 +4,8 @@ coordinator.py — Servidor Flask que espera la orden manual de inicio.
 Endpoints:
   GET  /status  → workers registrados, estado actual y chunks lentos en curso
   GET  /result  → resultado del último procesamiento e historial de ejecuciones
-  POST /start   → arranca el procesamiento (acepta {"retries": N} opcional)
+  POST /start   → arranca el procesamiento (acepta {"retries": N, "ground_truth": bool})
+  POST /reset   → vuelve a idle desde done/error (preserva historial)
 
 Variables de entorno:
   FILE_PATH      = "/app/wiki_es.txt"
@@ -137,7 +138,11 @@ def _enviar_chunk(
 # Procesamiento distribuido (corre en hilo daemon)
 # ---------------------------------------------------------------------------
 
-def _run_processing(num_chunks: int, max_retries: int | None = None) -> None:
+def _run_processing(
+    num_chunks: int,
+    max_retries: int | None = None,
+    ground_truth: bool = True,
+) -> None:
     global _state, _result
 
     try:
@@ -174,28 +179,32 @@ def _run_processing(num_chunks: int, max_retries: int | None = None) -> None:
         for palabra, cnt in total_counter.most_common(20):
             logger.info(f"  {palabra:<20} {cnt:>10,}")
 
-        # Ground truth secuencial (para calcular speedup)
-        logger.info("Iniciando conteo secuencial (ground truth) ...")
-        t0          = time.monotonic()
-        seq_counter: Counter = Counter()
-        with open(FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                seq_counter.update(re.findall(r"\b\w+\b", line.lower()))
-        t_seq = time.monotonic() - t0
+        # Ground truth secuencial — opcional, costosa en archivos grandes
+        t_seq = None
+        if ground_truth:
+            logger.info("Iniciando conteo secuencial (ground truth) ...")
+            t0          = time.monotonic()
+            seq_counter: Counter = Counter()
+            with open(FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    seq_counter.update(re.findall(r"\b\w+\b", line.lower()))
+            t_seq = time.monotonic() - t0
 
-        logger.info("=" * 60)
-        logger.info(f"Tiempo secuencial  : {t_seq:.2f}s")
-        if t_dist < t_seq:
-            logger.info(f"Speedup: {t_seq / t_dist:.2f}x más rápido")
+            logger.info("=" * 60)
+            logger.info(f"Tiempo secuencial  : {t_seq:.2f}s")
+            if t_dist < t_seq:
+                logger.info(f"Speedup: {t_seq / t_dist:.2f}x más rápido")
+            else:
+                logger.info(f"Speedup: {t_dist / t_seq:.2f}x más lento")
         else:
-            logger.info(f"Speedup: {t_dist / t_seq:.2f}x más lento")
+            logger.info("Ground truth omitido (ground_truth=false)")
 
         nuevo_resultado = {
             "exitosos":           exitosos,
             "num_chunks":         num_chunks,
             "tiempo_distribuido": round(t_dist, 2),
-            "tiempo_secuencial":  round(t_seq, 2),
-            "speedup":            round(t_seq / t_dist, 2) if t_dist > 0 else None,
+            "tiempo_secuencial":  round(t_seq, 2) if t_seq is not None else None,
+            "speedup":            round(t_seq / t_dist, 2) if t_seq and t_dist > 0 else None,
             "palabras_unicas":    len(total_counter),
             "top20":              total_counter.most_common(20),
         }
@@ -273,19 +282,46 @@ def result():
         })
 
 
+@app.route("/reset", methods=["POST"])
+def reset():
+    """
+    Vuelve el estado del coordinator a 'idle'.
+
+    Solo opera desde 'done' o 'error' — no interrumpe un procesamiento activo.
+    Limpia el resultado actual pero preserva el historial de ejecuciones.
+
+    Flujo de re-run recomendado:
+        POST /reset  →  POST /start
+    """
+    global _state, _result
+
+    with _lock:
+        if _state == "running":
+            return jsonify({"status": "error", "reason": "no se puede resetear mientras hay procesamiento activo"}), 409
+        estado_anterior = _state
+        _state  = "idle"
+        _result = {}
+
+    logger.info(f"Estado reseteado: {estado_anterior} → idle")
+    return jsonify({"status": "ok", "estado_anterior": estado_anterior})
+
+
 @app.route("/start", methods=["POST"])
 def start():
     """
     Arranca el procesamiento con los workers registrados en este momento.
 
     Body opcional (JSON):
-        retries (int): Número máximo de reintentos por chunk en el Ambassador.
-                       Si se omite, el Ambassador usa su config.MAX_RETRIES.
+        retries      (int):  Reintentos máximos por chunk en el Ambassador.
+                             Si se omite, el Ambassador usa su config.MAX_RETRIES.
+        ground_truth (bool): Si false, omite el conteo secuencial al final.
+                             Default: true. Útil para re-runs rápidos en demos.
     """
     global _state
 
-    body        = request.get_json(silent=True) or {}
-    max_retries = body.get("retries")   # None → el Ambassador decide
+    body         = request.get_json(silent=True) or {}
+    max_retries  = body.get("retries")                        # None → Ambassador decide
+    ground_truth = body.get("ground_truth", True)             # True → corre secuencial
 
     with _lock:
         if _state == "running":
@@ -308,18 +344,21 @@ def start():
     logger.info(f"Orden de inicio recibida — {num_chunks} worker(s): {workers}")
     if max_retries is not None:
         logger.info(f"Reintentos configurados: {max_retries}")
+    if not ground_truth:
+        logger.info("Ground truth desactivado para esta corrida")
 
     threading.Thread(
         target=_run_processing,
-        args=(num_chunks, max_retries),
+        args=(num_chunks, max_retries, ground_truth),
         daemon=True,
     ).start()
 
     return jsonify({
-        "status":      "started",
-        "workers":     workers,
-        "num_chunks":  num_chunks,
-        "max_retries": max_retries,
+        "status":       "started",
+        "workers":      workers,
+        "num_chunks":   num_chunks,
+        "max_retries":  max_retries,
+        "ground_truth": ground_truth,
     })
 
 
@@ -329,7 +368,9 @@ def start():
 
 if __name__ == "__main__":
     logger.info(f"Coordinator listo en puerto {PORT}")
-    logger.info(f"  GET  http://localhost:{PORT}/status  → ver workers y estado")
-    logger.info(f"  GET  http://localhost:{PORT}/result  → ver resultado e historial")
-    logger.info(f"  POST http://localhost:{PORT}/start   → arrancar procesamiento")
+    logger.info(f"  GET  http://localhost:{PORT}/status              → ver workers y estado")
+    logger.info(f"  GET  http://localhost:{PORT}/result              → ver resultado e historial")
+    logger.info(f'  POST http://localhost:{PORT}/start               → arrancar procesamiento')
+    logger.info(f'       body opcional: {{"retries": N, "ground_truth": false}}')
+    logger.info(f"  POST http://localhost:{PORT}/reset               → volver a idle (re-run)")
     app.run(host="0.0.0.0", port=PORT)

@@ -17,6 +17,12 @@ services:
     ports:
       - "5005:5005"
     restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5005/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   # ---------------------------------------------------------------------------
   # Worker local — para pruebas en una sola laptop sin red real
@@ -34,7 +40,8 @@ services:
     volumes:
       - ./wiki_es.txt:/app/data/input.txt:ro
     depends_on:
-      - ambassador
+      ambassador:
+        condition: service_healthy
     restart: on-failure
 
   # ---------------------------------------------------------------------------
@@ -52,5 +59,6 @@ services:
     volumes:
       - ./wiki_es.txt:/app/wiki_es.txt:ro
     depends_on:
-      - ambassador
+      ambassador:
+        condition: service_healthy
     restart: on-failure
