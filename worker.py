@@ -19,6 +19,7 @@ Variables de entorno:
 import logging
 import os
 import re
+import threading
 import time
 from collections import Counter
 
@@ -189,11 +190,17 @@ def count_words():
 # Registro dinámico con el Ambassador
 # ---------------------------------------------------------------------------
 
-def register_with_ambassador(max_attempts: int = 15, delay: float = 2.0) -> None:
+_registered = threading.Event()
+
+
+def _registration_loop(interval: float = 5.0) -> None:
     """
-    Anuncia este worker al Ambassador para entrar al pool dinámico.
-    El Ambassador asigna el worker_id centralmente y lo devuelve.
-    Reintenta hasta max_attempts veces (el Ambassador puede no estar listo aún).
+    Hilo daemon que mantiene el registro con el Ambassador.
+
+    - Intenta registrarse indefinidamente hasta lograrlo.
+    - Una vez registrado, hace ping periódico al Ambassador para detectar
+      si se cayó. Si pierde contacto, vuelve a intentar registrarse.
+    - Corre en background: el worker acepta requests en paralelo.
     """
     global WORKER_ID
 
@@ -201,24 +208,38 @@ def register_with_ambassador(max_attempts: int = 15, delay: float = 2.0) -> None
         logger.info(f"[{WORKER_ID}] AMBASSADOR_URL no configurado — modo standalone")
         return
 
-    url     = f"{AMBASSADOR_URL}/register"
-    payload = {"url": WORKER_URL}
+    register_url = f"{AMBASSADOR_URL}/register"
+    health_url   = f"{AMBASSADOR_URL}/health"
+    payload      = {"url": WORKER_URL}
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = requests.post(url, json=payload, timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                WORKER_ID = data.get("worker_id", WORKER_ID)
-                logger.info(f"[{WORKER_ID}] Registrado en Ambassador: {WORKER_URL}")
-                return
-        except Exception as e:
-            logger.warning(f"[{WORKER_ID}] Intento {attempt}/{max_attempts} fallido: {e}")
-        time.sleep(delay)
+    while True:
+        # --- Fase 1: registrarse (reintenta para siempre) ---
+        while not _registered.is_set():
+            try:
+                r = requests.post(register_url, json=payload, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    WORKER_ID = data.get("worker_id", WORKER_ID)
+                    logger.info(f"[{WORKER_ID}] Registrado en Ambassador: {WORKER_URL}")
+                    _registered.set()
+                    break
+            except Exception as e:
+                logger.warning(f"[{WORKER_ID}] Registro fallido: {e} — reintentando en {interval}s")
+            time.sleep(interval)
 
-    logger.error(f"[{WORKER_ID}] No se pudo registrar tras {max_attempts} intentos")
+        # --- Fase 2: vigilar conexión con Ambassador ---
+        while _registered.is_set():
+            time.sleep(interval)
+            try:
+                r = requests.get(health_url, timeout=3)
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+            except Exception as e:
+                logger.warning(f"[{WORKER_ID}] Ambassador inalcanzable: {e} — re-registrando")
+                _registered.clear()
+                break
 
 
 if __name__ == "__main__":
-    register_with_ambassador()
+    threading.Thread(target=_registration_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
