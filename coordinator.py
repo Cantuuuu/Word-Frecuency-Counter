@@ -2,10 +2,18 @@
 coordinator.py — Servidor Flask que espera la orden manual de inicio.
 
 Endpoints:
-  GET  /status  → workers registrados, estado actual y chunks lentos en curso
-  GET  /result  → resultado del último procesamiento e historial de ejecuciones
-  POST /start   → arranca el procesamiento (acepta {"retries": N, "ground_truth": bool})
-  POST /reset   → vuelve a idle desde done/error (preserva historial)
+  GET  /status       → workers, estado actual y chunks lentos en curso
+  GET  /result       → resultado del último procesamiento e historial
+  POST /start        → arranca el procesamiento (acepta {"retries": N, "ground_truth": bool})
+  POST /reset        → vuelve a idle desde done/partial/error (preserva historial)
+  POST /retry-failed → re-despacha solo los chunks que fallaron en la última corrida
+
+Estados:
+  idle    → sin procesar
+  running → procesamiento en curso
+  done    → todos los chunks completados
+  partial → algunos chunks fallaron (resultado incompleto)
+  error   → fallo catastrófico (excepción no esperada)
 
 Variables de entorno:
   FILE_PATH      = "/app/wiki_es.txt"
@@ -54,9 +62,12 @@ app = Flask(__name__)
 # Estado global del procesamiento
 # ---------------------------------------------------------------------------
 
-_state  = "idle"   # idle | running | done | error
+_state  = "idle"   # idle | running | done | partial | error
 _result: dict = {}
 _lock   = threading.Lock()
+
+# Counter completo preservado entre corridas para poder fusionar en /retry-failed
+_total_counter: Counter = Counter()
 
 # Tiempos de inicio por chunk — para detectar chunks lentos en /status
 _chunk_times: dict[int, float] = {}
@@ -74,6 +85,19 @@ def _get_workers() -> list[str]:
     r = requests.get(f"{AMBASSADOR_URL}/workers/status", timeout=5)
     r.raise_for_status()
     return r.json().get("registered", [])
+
+
+def _get_workers_listos() -> list[str]:
+    """
+    Llama a GET /workers/health del Ambassador y retorna solo los workers
+    que responden y tienen el archivo accesible.
+
+    Si el endpoint no está disponible, retorna lista vacía para que el
+    caller pueda degradar graciosamente.
+    """
+    r = requests.get(f"{AMBASSADOR_URL}/workers/health", timeout=10)
+    r.raise_for_status()
+    return r.json().get("listos", [])
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +129,6 @@ def _enviar_chunk(
     """
     Despacha un chunk al Ambassador y registra su tiempo de inicio para
     que /status pueda detectar chunks lentos.
-
-    Si max_retries se especifica, se incluye en el payload para que el
-    Ambassador lo use en lugar de su config.MAX_RETRIES por defecto.
     """
     logger.info(f"Enviando chunk_{chunk_id}: bytes {inicio:,} → {fin:,}")
 
@@ -143,13 +164,14 @@ def _run_processing(
     max_retries: int | None = None,
     ground_truth: bool = True,
 ) -> None:
-    global _state, _result
+    global _state, _result, _total_counter
 
     try:
-        chunks     = _calcular_chunks(FILE_PATH, num_chunks)
-        t_inicio   = time.monotonic()
-        resultados = {}
+        chunks   = _calcular_chunks(FILE_PATH, num_chunks)
+        t_inicio = time.monotonic()
+        resultados: dict[int, dict] = {}
 
+        # --- Fase 1: despachar todos los chunks en paralelo ---
         with ThreadPoolExecutor(max_workers=num_chunks) as pool:
             futuros = {
                 pool.submit(_enviar_chunk, i, start, end, max_retries): i
@@ -160,26 +182,52 @@ def _run_processing(
                 cid  = resp.get("chunk_id", futuros[futuro])
                 resultados[cid] = resp
 
+        # --- Fase 2: auto-reintento de chunks fallidos (B1) ---
+        fallidos_ids = [cid for cid, r in resultados.items() if r.get("status") != "ok"]
+        if fallidos_ids:
+            logger.info(f"Auto-reintento: {len(fallidos_ids)} chunk(s) fallido(s) → reintentando")
+            with ThreadPoolExecutor(max_workers=len(fallidos_ids)) as pool:
+                futuros_retry = {
+                    pool.submit(_enviar_chunk, cid, chunks[cid][0], chunks[cid][1], max_retries): cid
+                    for cid in fallidos_ids
+                }
+                for futuro in as_completed(futuros_retry):
+                    resp = futuro.result()
+                    cid  = resp.get("chunk_id", futuros_retry[futuro])
+                    resultados[cid] = resp   # sobreescribe con el resultado del reintento
+
         t_dist = time.monotonic() - t_inicio
 
+        # --- Contar resultados finales ---
         total_counter: Counter = Counter()
         exitosos = 0
+        chunks_fallidos_info: list[dict] = []
+
         for cid, resp in resultados.items():
             if resp.get("status") == "ok":
                 total_counter.update(resp.get("result", {}))
                 exitosos += 1
             else:
-                logger.warning(f"chunk_{cid} fallido: {resp.get('reason', 'desconocido')}")
+                reason = resp.get("reason", "desconocido")
+                logger.warning(f"chunk_{cid} fallido definitivo: {reason}")
+                chunks_fallidos_info.append({
+                    "chunk_id": cid,
+                    "inicio":   chunks[cid][0],
+                    "fin":      chunks[cid][1],
+                    "reason":   reason,
+                })
+
+        estado_final = "done" if exitosos == num_chunks else "partial"
 
         logger.info("=" * 60)
-        logger.info(f"Chunks exitosos    : {exitosos} / {num_chunks}")
+        logger.info(f"Chunks exitosos    : {exitosos} / {num_chunks}  [{estado_final.upper()}]")
         logger.info(f"Tiempo distribuido : {t_dist:.2f}s")
         logger.info(f"Palabras únicas    : {len(total_counter):,}")
         logger.info("Top 20 palabras:")
         for palabra, cnt in total_counter.most_common(20):
             logger.info(f"  {palabra:<20} {cnt:>10,}")
 
-        # Ground truth secuencial — opcional, costosa en archivos grandes
+        # --- Ground truth secuencial (opcional) ---
         t_seq = None
         if ground_truth:
             logger.info("Iniciando conteo secuencial (ground truth) ...")
@@ -207,14 +255,16 @@ def _run_processing(
             "speedup":            round(t_seq / t_dist, 2) if t_seq and t_dist > 0 else None,
             "palabras_unicas":    len(total_counter),
             "top20":              total_counter.most_common(20),
+            "chunks_fallidos":    chunks_fallidos_info,
         }
 
         with _lock:
-            _state  = "done"
-            _result = nuevo_resultado
+            _state         = estado_final
+            _result        = nuevo_resultado
+            _total_counter = total_counter   # preservar para /retry-failed
             _history.append({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                **nuevo_resultado,
+                **{k: v for k, v in nuevo_resultado.items() if k != "chunks_fallidos"},
             })
             if len(_history) > MAX_HISTORY:
                 _history.pop(0)
@@ -269,12 +319,7 @@ def status():
 
 @app.route("/result", methods=["GET"])
 def result():
-    """
-    Resultado del último procesamiento e historial de las últimas ejecuciones.
-
-    Útil para integración con otros sistemas o comparar corridas sin
-    necesidad de revisar los logs manualmente.
-    """
+    """Resultado del último procesamiento e historial de las últimas ejecuciones."""
     with _lock:
         return jsonify({
             "estado":    _state,
@@ -288,23 +333,100 @@ def reset():
     """
     Vuelve el estado del coordinator a 'idle'.
 
-    Solo opera desde 'done' o 'error' — no interrumpe un procesamiento activo.
-    Limpia el resultado actual pero preserva el historial de ejecuciones.
+    Opera desde done, partial o error — no interrumpe un procesamiento activo.
+    Limpia el resultado actual y el counter acumulado, preserva el historial.
 
     Flujo de re-run recomendado:
         POST /reset  →  POST /start
     """
-    global _state, _result
+    global _state, _result, _total_counter
 
     with _lock:
         if _state == "running":
             return jsonify({"status": "error", "reason": "no se puede resetear mientras hay procesamiento activo"}), 409
         estado_anterior = _state
-        _state  = "idle"
-        _result = {}
+        _state         = "idle"
+        _result        = {}
+        _total_counter = Counter()
 
     logger.info(f"Estado reseteado: {estado_anterior} → idle")
     return jsonify({"status": "ok", "estado_anterior": estado_anterior})
+
+
+@app.route("/retry-failed", methods=["POST"])
+def retry_failed():
+    """
+    Re-despacha únicamente los chunks que fallaron en la última corrida.
+
+    Útil cuando un worker se cayó y se recuperó: en lugar de repetir todo
+    desde cero, solo procesa el fragmento faltante y fusiona el resultado
+    con los conteos ya calculados.
+
+    Solo opera desde estado 'partial'. Si todos los chunks del reintento
+    tienen éxito, el estado pasa a 'done'; si alguno vuelve a fallar,
+    permanece en 'partial'.
+    """
+    global _state, _result, _total_counter
+
+    with _lock:
+        if _state == "running":
+            return jsonify({"status": "error", "reason": "procesamiento activo — espera a que termine"}), 409
+        if _state != "partial":
+            return jsonify({
+                "status": "error",
+                "reason": f"solo aplica en estado 'partial', estado actual: '{_state}'",
+            }), 409
+        chunks_fallidos = list(_result.get("chunks_fallidos", []))
+        if not chunks_fallidos:
+            return jsonify({"status": "ok", "reason": "no hay chunks fallidos que reintentar"}), 200
+        _state = "running"
+
+    logger.info(f"Reintentando {len(chunks_fallidos)} chunk(s) fallido(s) manualmente")
+
+    nuevos_resultados: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(chunks_fallidos)) as pool:
+        futuros = {
+            pool.submit(_enviar_chunk, c["chunk_id"], c["inicio"], c["fin"]): c["chunk_id"]
+            for c in chunks_fallidos
+        }
+        for futuro in as_completed(futuros):
+            resp = futuro.result()
+            cid  = resp.get("chunk_id", futuros[futuro])
+            nuevos_resultados[cid] = resp
+
+    with _lock:
+        recuperados  = 0
+        aun_fallidos = []
+
+        for chunk_info in chunks_fallidos:
+            cid  = chunk_info["chunk_id"]
+            resp = nuevos_resultados.get(cid, {})
+            if resp.get("status") == "ok":
+                _total_counter.update(resp.get("result", {}))
+                recuperados += 1
+            else:
+                aun_fallidos.append({
+                    **chunk_info,
+                    "reason": resp.get("reason", "desconocido"),
+                })
+
+        nuevo_exitosos = _result["exitosos"] + recuperados
+        _result.update({
+            "exitosos":        nuevo_exitosos,
+            "palabras_unicas": len(_total_counter),
+            "top20":           _total_counter.most_common(20),
+            "chunks_fallidos": aun_fallidos,
+        })
+        _state = "done" if nuevo_exitosos == _result["num_chunks"] else "partial"
+        estado_final = _state
+
+    logger.info(f"Retry: {recuperados}/{len(chunks_fallidos)} recuperados → estado: {estado_final}")
+    return jsonify({
+        "status":       "ok",
+        "recuperados":  recuperados,
+        "aun_fallidos": len(aun_fallidos),
+        "estado":       estado_final,
+    })
 
 
 @app.route("/start", methods=["POST"])
@@ -312,17 +434,20 @@ def start():
     """
     Arranca el procesamiento con los workers registrados en este momento.
 
+    Antes de despachar, verifica la salud de cada worker (GET /workers/health
+    en el Ambassador). Los workers sin archivo accesible o sin respuesta se
+    excluyen automáticamente. Si el health check falla por completo, se usa
+    la lista completa de workers registrados como fallback.
+
     Body opcional (JSON):
         retries      (int):  Reintentos máximos por chunk en el Ambassador.
-                             Si se omite, el Ambassador usa su config.MAX_RETRIES.
         ground_truth (bool): Si false, omite el conteo secuencial al final.
-                             Default: true. Útil para re-runs rápidos en demos.
     """
     global _state
 
     body         = request.get_json(silent=True) or {}
-    max_retries  = body.get("retries")                        # None → Ambassador decide
-    ground_truth = body.get("ground_truth", True)             # True → corre secuencial
+    max_retries  = body.get("retries")
+    ground_truth = body.get("ground_truth", True)
 
     with _lock:
         if _state == "running":
@@ -339,6 +464,7 @@ def start():
             _state = "idle"
         return jsonify({"status": "error", "reason": f"archivo vacío: {FILE_PATH}"}), 500
 
+    # Obtener workers registrados
     try:
         workers = _get_workers()
     except Exception as e:
@@ -351,8 +477,29 @@ def start():
             _state = "idle"
         return jsonify({"status": "error", "reason": "no hay workers registrados"}), 503
 
+    # Health check — filtrar workers sin archivo accesible o sin respuesta (C1)
+    workers_excluidos = []
+    try:
+        listos = _get_workers_listos()
+        workers_excluidos = [w for w in workers if w not in listos]
+        if workers_excluidos:
+            logger.warning(f"Workers excluidos (sin respuesta o archivo inaccesible): {workers_excluidos}")
+        if listos:
+            workers = listos
+        else:
+            logger.warning("Health check devolvió 0 workers listos — usando todos los registrados")
+    except Exception as e:
+        logger.warning(f"Health check falló: {e} — usando todos los workers registrados")
+
+    if not workers:
+        with _lock:
+            _state = "idle"
+        return jsonify({"status": "error", "reason": "no hay workers listos para procesar"}), 503
+
     num_chunks = len(workers)
-    logger.info(f"Orden de inicio recibida — {num_chunks} worker(s): {workers}")
+    logger.info(f"Orden de inicio recibida — {num_chunks} worker(s) listos: {workers}")
+    if workers_excluidos:
+        logger.info(f"Workers excluidos: {workers_excluidos}")
     if max_retries is not None:
         logger.info(f"Reintentos configurados: {max_retries}")
     if not ground_truth:
@@ -365,11 +512,12 @@ def start():
     ).start()
 
     return jsonify({
-        "status":       "started",
-        "workers":      workers,
-        "num_chunks":   num_chunks,
-        "max_retries":  max_retries,
-        "ground_truth": ground_truth,
+        "status":             "started",
+        "workers":            workers,
+        "workers_excluidos":  workers_excluidos,
+        "num_chunks":         num_chunks,
+        "max_retries":        max_retries,
+        "ground_truth":       ground_truth,
     })
 
 
@@ -379,9 +527,9 @@ def start():
 
 if __name__ == "__main__":
     logger.info(f"Coordinator listo en puerto {PORT}")
-    logger.info(f"  GET  http://localhost:{PORT}/status              → ver workers y estado")
-    logger.info(f"  GET  http://localhost:{PORT}/result              → ver resultado e historial")
-    logger.info(f'  POST http://localhost:{PORT}/start               → arrancar procesamiento')
-    logger.info(f'       body opcional: {{"retries": N, "ground_truth": false}}')
-    logger.info(f"  POST http://localhost:{PORT}/reset               → volver a idle (re-run)")
+    logger.info(f"  GET  http://localhost:{PORT}/status        → ver workers y estado")
+    logger.info(f"  GET  http://localhost:{PORT}/result        → ver resultado e historial")
+    logger.info(f'  POST http://localhost:{PORT}/start         → arrancar  [{{"retries": N, "ground_truth": false}}]')
+    logger.info(f"  POST http://localhost:{PORT}/reset         → volver a idle")
+    logger.info(f"  POST http://localhost:{PORT}/retry-failed  → re-procesar chunks fallidos")
     app.run(host="0.0.0.0", port=PORT)

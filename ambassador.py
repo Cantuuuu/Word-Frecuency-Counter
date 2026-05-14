@@ -6,6 +6,7 @@ Responsabilidades:
     ya existía con el circuito abierto (worker reiniciado = worker sano).
   - Dar de baja workers manualmente (DELETE /workers/<id>).
   - Resetear todos los Circuit Breakers (POST /workers/reset-cbs).
+  - Verificar salud de todos los workers en paralelo (GET /workers/health).
   - Recibir chunks del Coordinator (POST /dispatch).
   - Seleccionar un worker disponible mediante Round-Robin Inteligente.
   - Reenviar el chunk al worker seleccionado (POST /count).
@@ -22,6 +23,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, jsonify, request
@@ -404,6 +406,56 @@ def reset_cbs():
 
     logger.info(f"Circuit Breakers reseteados: {reseteados}")
     return jsonify({"status": "ok", "reseteados": reseteados, "total": len(reseteados)})
+
+
+@app.route("/workers/health", methods=["GET"])
+def workers_health():
+    """
+    Verifica la salud de todos los workers registrados en paralelo.
+
+    Para cada worker hace GET /health con timeout corto (3s). Un worker se
+    considera 'listo' si responde y su archivo es accesible (file_accessible=true).
+
+    Retorna:
+        listos   (list): Workers que responden y tienen el archivo accesible.
+        n_listos (int):  Cantidad de workers listos.
+        detalle  (dict): Resultado individual por worker.
+    """
+    with _workers_lock:
+        snapshot = dict(_workers)
+
+    if not snapshot:
+        return jsonify({"listos": [], "n_listos": 0, "detalle": {}})
+
+    def _check(worker_id: str, url_base: str) -> tuple[str, dict]:
+        try:
+            r = requests.get(f"{url_base}/health", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                return worker_id, {
+                    "reachable":       True,
+                    "file_accessible": data.get("file_accessible", True),
+                    "uptime_s":        data.get("uptime_s"),
+                    "url":             url_base,
+                }
+            return worker_id, {"reachable": False, "reason": f"HTTP {r.status_code}", "url": url_base}
+        except Exception as e:
+            return worker_id, {"reachable": False, "reason": str(e), "url": url_base}
+
+    detalle: dict = {}
+    with ThreadPoolExecutor(max_workers=len(snapshot)) as pool:
+        futuros = {pool.submit(_check, wid, url): wid for wid, url in snapshot.items()}
+        for futuro in as_completed(futuros):
+            wid, info = futuro.result()
+            detalle[wid] = info
+
+    listos = [
+        wid for wid, info in detalle.items()
+        if info.get("reachable") and info.get("file_accessible", True)
+    ]
+
+    logger.info(f"Health check: {len(listos)}/{len(snapshot)} workers listos")
+    return jsonify({"listos": listos, "n_listos": len(listos), "detalle": detalle})
 
 
 @app.route("/workers/status", methods=["GET"])

@@ -20,16 +20,16 @@ AMBASSADOR_PORT = 5005
 # Circuit Breaker
 # ---------------------------------------------------------------------------
 
-FAIL_MAX      = 3    # Fallos consecutivos necesarios para abrir el circuito
+FAIL_MAX      = 2    # Fallos consecutivos para abrir el circuito (2 = reacciona rápido)
 RESET_TIMEOUT = 10   # Segundos en OPEN antes de pasar a HALF_OPEN
 
 # ---------------------------------------------------------------------------
 # Política de reintentos
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES = 1   # 1 = sin reintentos. Con chunks de ~1.7 GB, un fallo es timeout
-                  # genuino o worker caído; reintentar sobre el mismo archivo
-                  # solo multiplica el tiempo de espera sin recuperar datos.
+MAX_RETRIES = 2   # Intentos por chunk en el Ambassador (2 = 1 reintento real).
+                  # El coordinator también hace un pase de auto-reintento al final
+                  # para chunks que fallaron en todos los intentos del Ambassador.
 
 # ---------------------------------------------------------------------------
 # Timeout de red
