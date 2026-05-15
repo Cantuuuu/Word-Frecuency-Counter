@@ -102,7 +102,71 @@ La lectura en bloques de 64 MB evita cargar chunks de gigabytes en memoria. El a
 
 ---
 
-## 4. Conclusion
+## 4. Decisiones de Diseno
+
+### 4.1 Archivo local en cada nodo (no transferencia por red)
+
+El archivo `wiki_es.txt` reside en cada computadora participante. El Coordinator solo envia rangos de bytes (dos enteros) y recibe diccionarios de frecuencia (JSON de kilobytes). La alternativa seria que un nodo central sirviera el archivo por red, pero transferir 5.2 GB por WiFi a cada worker seria el cuello de botella dominante. Con copias locales, el unico factor limitante es la velocidad de disco de cada nodo.
+
+### 4.2 Bind mount en vez de COPY en Docker
+
+El archivo no se incluye en la imagen Docker (`COPY` lo haria parte de la imagen de ~5.3 GB). En su lugar, se monta como volumen de solo lectura (`-v wiki_es.txt:/app/data/input.txt:ro`). Esto mantiene las imagenes ligeras (~150 MB) y permite cambiar el archivo sin reconstruir la imagen.
+
+### 4.3 Ambassador como punto unico de contacto
+
+El Coordinator no conoce la existencia de workers individuales. Solo se comunica con el Ambassador via tres endpoints: `POST /dispatch`, `GET /workers/status` y `GET /workers/health`. Toda la logica de seleccion, reintentos, Circuit Breakers y registro vive en el Ambassador. Esto permite que el Coordinator se mantenga simple (orquestacion pura) y que la politica de balanceo/resiliencia sea modificable sin tocar el Coordinator.
+
+### 4.4 IDs asignados por el Ambassador (no por el worker)
+
+El Ambassador asigna `worker_01`, `worker_02`, etc. de forma autoincremental al registrarse. Si el worker enviara su propio ID, habria riesgo de colisiones o inconsistencias. Con asignacion centralizada, el Ambassador garantiza unicidad y puede detectar re-registros por URL.
+
+### 4.5 Flask threaded=True en el Ambassador
+
+El Ambassador corre con `threaded=True` para atender multiples dispatches concurrentes. Sin esto, los chunks se encolarian y el despacho paralelo del Coordinator seria secuencial en la practica. Los Circuit Breakers usan `threading.RLock` para proteger su estado ante accesos concurrentes.
+
+### 4.6 Puerto 5005 para el Ambassador
+
+Se evito el puerto 5000 porque macOS lo ocupa con AirPlay Receiver, lo que causaria conflictos en equipos Apple del equipo de trabajo.
+
+### 4.7 Timeout de 600 segundos
+
+El procesamiento de un chunk de ~1.7 GB (con 3 workers) sobre disco local en Docker puede tomar varios minutos. Un timeout demasiado corto causaria falsos positivos en el Circuit Breaker. 600 segundos (10 minutos) da margen suficiente para discos lentos o sistemas con alta carga de virtualizacion.
+
+### 4.8 RETRY_DELAY de 10 segundos en el Coordinator
+
+El Coordinator espera 10 segundos entre reintentos persistentes. Un valor mas bajo saturaria al Ambassador con peticiones que probablemente siguen fallando. Un valor mas alto retrasaria la recuperacion cuando un worker vuelve. 10 segundos es un compromiso que permite al worker completar su re-registro (que ocurre cada 15 segundos) antes del siguiente intento.
+
+### 4.9 Persistencia del registro de workers
+
+El Ambassador guarda el registro en `workers_registry.json`. Si el Ambassador se reinicia, recupera la lista de workers sin esperar que cada uno se re-registre. Los CBs se crean en CLOSED al cargar, y si un worker ya no esta disponible, el CB lo detectara en el primer fallo.
+
+---
+
+## 5. Puntos de Mejora
+
+### 5.1 Chunks estaticos: un chunk por worker
+
+Actualmente `num_chunks = len(workers)`, asignando exactamente un chunk por worker. Si un worker tiene disco mas rapido que otro, terminara antes y quedara ocioso mientras el lento continua. Una mejora seria dividir en mas chunks que workers (por ejemplo, `4 * N`) y asignarlos bajo demanda: cuando un worker termina un chunk, recibe el siguiente pendiente. Esto lograria balanceo dinamico natural.
+
+### 5.2 Punto unico de fallo: el Ambassador
+
+Si el Ambassador se cae, todo el sistema se detiene. Los workers no pueden registrarse y el Coordinator no puede despachar. Una mejora seria tener multiples instancias del Ambassador detras de un load balancer, o que el Coordinator pueda comunicarse directamente con workers como fallback.
+
+### 5.3 Transferencia de resultados grandes
+
+Cada worker retorna un diccionario completo `{palabra: conteo}` como JSON. Con un vocabulario de millones de palabras unicas, estos diccionarios pueden pesar decenas de megabytes. Una mejora seria que cada worker retorne solo las top-N palabras, o comprimir el JSON con gzip, o usar un formato binario mas eficiente.
+
+### 5.4 Sin autenticacion entre servicios
+
+Cualquier maquina en la misma red puede registrarse como worker o enviar dispatches al Ambassador. En un entorno de produccion, se necesitarian tokens de autenticacion o mTLS entre los servicios.
+
+### 5.5 Historial en memoria
+
+El historial de ejecuciones (`_history`, maximo 5 entradas) se pierde al reiniciar el Coordinator. Una mejora seria persistirlo en disco, similar a como el Ambassador persiste el registro de workers.
+
+---
+
+## 6. Conclusion
 
 ### El rol del Ambassador
 
@@ -126,4 +190,9 @@ La combinacion de Ambassador y Circuit Breaker crea un sistema que se adapta din
 
 ---
 
-*Sistemas Distribuidos — Proyecto Final*
+*Sistemas Distribuidos*
+
+**Integrantes:**
+- Arturo Cantu Olivarez — 294863
+- Luis Fernando Maldonado — 325677
+- Jesus Gabriel Gudino Lara — 325675
