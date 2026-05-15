@@ -32,15 +32,15 @@ graph LR
         W2 --- D2
     end
 
-    U -->|"POST /start<br>POST /reset<br>POST /retry-failed<br>GET /status<br>GET /result"| CO
+    U -->|"GET / (dashboard)<br>POST /start<br>POST /reset<br>GET /status<br>GET /result"| CO
     U -->|"GET /workers/status<br>GET /workers/health<br>POST /workers/reset-cbs<br>DELETE /workers/id"| AM
     CO -->|"POST /dispatch<br>GET /workers/status<br>GET /workers/health"| AM
     AM -->|"POST /count<br>GET /health"| WL
     AM -->|"POST /count<br>GET /health"| W1
     AM -->|"POST /count<br>GET /health"| W2
-    WL -.->|"POST /register<br>(auto-registro al arrancar)"| AM
-    W1 -.->|"POST /register<br>(auto-registro al arrancar)"| AM
-    W2 -.->|"POST /register<br>(auto-registro al arrancar)"| AM
+    WL -.->|"POST /register<br>(reintento indefinido c/15s<br>+ monitoreo continuo)"| AM
+    W1 -.->|"POST /register<br>(reintento indefinido c/15s<br>+ monitoreo continuo)"| AM
+    W2 -.->|"POST /register<br>(reintento indefinido c/15s<br>+ monitoreo continuo)"| AM
 
     style CO fill:#4A90D9,color:#fff
     style AM fill:#E67E22,color:#fff
@@ -61,20 +61,27 @@ sequenceDiagram
     participant W1 as Worker 1 :5001
     participant W2 as Worker 2 :5001
 
-    Note over W1,W2: Fase 0 — Auto-registro al arrancar (hasta 15 intentos, c/2s)
+    Note over W1,W2: Fase 0 — Auto-registro (reintentos indefinidos, c/15s)
 
-    W1->>AM: POST /register {worker_id, url}
+    W1->>AM: POST /register {url}
     AM->>AM: Crea CircuitBreaker(w1, fail_max=2, reset_timeout=10)
     AM->>AM: _save_registry() → workers_registry.json
-    AM-->>W1: 200 OK {total_workers: 1}
-    W2->>AM: POST /register {worker_id, url}
+    AM-->>W1: 200 OK {worker_id: "worker_01", total_workers: 1}
+    W2->>AM: POST /register {url}
     AM->>AM: Crea CircuitBreaker(w2, fail_max=2, reset_timeout=10)
     AM->>AM: _save_registry() → workers_registry.json
-    AM-->>W2: 200 OK {total_workers: 2}
+    AM-->>W2: 200 OK {worker_id: "worker_02", total_workers: 2}
+
+    Note over W1,W2: Fase 0b — Monitoreo continuo (c/15s)
+    loop Cada 15s tras registro
+        W1->>AM: GET /health (timeout 3s)
+        AM-->>W1: 200 {status: ok, service: ambassador}
+        Note over W1: Si falla → _registered.clear() → vuelve a Fase 0
+    end
 
     Note over U,W2: Fase 1 — Inicio del procesamiento
 
-    U->>CO: POST /start {retries: 2, ground_truth: true}
+    U->>CO: POST /start {ground_truth: true}
     CO->>CO: Valida archivo (os.path.isfile + getsize > 0)
     CO->>AM: GET /workers/status
     AM-->>CO: {registered: [w1, w2]}
@@ -93,7 +100,7 @@ sequenceDiagram
     Note over CO,W2: Fase 2 — Despacho paralelo (ThreadPoolExecutor)
 
     par Chunk 0
-        CO->>AM: POST /dispatch {chunk_id:0, inicio:0, fin:2.6GB, max_retries:2}
+        CO->>AM: POST /dispatch {chunk_id:0, inicio:0, fin:2.6GB}
         AM->>AM: _seleccionar_worker() → Round-Robin + CB allow_request() + busy check
         AM->>W1: POST /count {start:0, end:2.6GB}
         W1->>W1: _ajustar_inicio(start) → alinea a frontera de palabra
@@ -103,7 +110,7 @@ sequenceDiagram
         AM->>AM: cb_w1.record_success() → fail_count=0
         AM-->>CO: {chunk_id:0, status:ok, result:{...}}
     and Chunk 1
-        CO->>AM: POST /dispatch {chunk_id:1, inicio:2.6GB, fin:5.2GB, max_retries:2}
+        CO->>AM: POST /dispatch {chunk_id:1, inicio:2.6GB, fin:5.2GB}
         AM->>AM: _seleccionar_worker() → w2
         AM->>W2: POST /count {start:2.6GB, end:5.2GB}
         W2->>W2: _ajustar_inicio(start) → alinea a frontera de palabra
@@ -116,8 +123,7 @@ sequenceDiagram
     Note over CO: Fase 3 — Agregación
 
     CO->>CO: total_counter.update() por cada chunk exitoso
-    CO->>CO: estado → "done" (2/2 exitosos)
-    CO->>CO: _total_counter preservado para posible /retry-failed
+    CO->>CO: estado → "done" (todos los chunks completados)
 
     Note over CO: Ground truth secuencial (opcional)
 
@@ -136,62 +142,76 @@ sequenceDiagram
     participant AM as Ambassador :5005
     participant CB1 as CB: Worker 1
     participant CB2 as CB: Worker 2
+    participant CB3 as CB: Worker 3
     participant W1 as Worker 1
     participant W2 as Worker 2
+    participant W3 as Worker 3
 
-    Note over CB1,CB2: Ambos CB inician en CLOSED (fail_count=0, fail_max=2)
+    Note over CB1,CB3: Todos los CB inician en CLOSED (fail_count=0, fail_max=2)
 
-    CO->>AM: POST /dispatch {chunk_id:0, inicio:0, fin:2.6GB, max_retries:2}
+    CO->>AM: POST /dispatch {chunk_id:0, inicio:0, fin:1.7GB, max_retries:3}
 
-    Note over AM: Intento 1/2 — ya_fallaron = {}
+    Note over AM: Intento 1/3 — ya_fallaron = {}
 
     AM->>AM: _seleccionar_worker() → w1
     AM->>CB1: allow_request()?
     CB1-->>AM: true (CLOSED)
     AM->>AM: _busy_workers.add(w1)
-    AM->>W1: POST /count {start:0, end:2.6GB} (timeout=600s)
+    AM->>W1: POST /count {start:0, end:1.7GB} (timeout=600s)
     W1--xAM: Timeout / ConnectionError
     AM->>CB1: record_failure() → fail_count=1
     AM->>AM: _busy_workers.discard(w1) (finally)
     AM->>AM: ya_fallaron.add(w1)
 
-    Note over AM: Intento 2/2 — ya_fallaron = {w1}
+    Note over AM: Intento 2/3 — ya_fallaron = {w1}
 
     AM->>AM: _seleccionar_worker(excluidos={w1}) → w2
     AM->>CB2: allow_request()?
     CB2-->>AM: true (CLOSED)
     AM->>AM: _busy_workers.add(w2)
-    AM->>W2: POST /count {start:0, end:2.6GB}
-    W2-->>AM: {result: {word:count,...}}
-    AM->>CB2: record_success() → fail_count=0
+    AM->>W2: POST /count {start:0, end:1.7GB}
+    W2--xAM: ConnectionError
+    AM->>CB2: record_failure() → fail_count=1
     AM->>AM: _busy_workers.discard(w2) (finally)
-    AM-->>CO: {chunk_id:0, status:ok, worker_id:w2, result:{...}}
+    AM->>AM: ya_fallaron.add(w2)
 
-    Note over CO,W2: Segundo chunk — CB1 aún CLOSED (fail_count=1), nuevo dispatch → ya_fallaron = {}
+    Note over AM: Intento 3/3 — ya_fallaron = {w1, w2}
 
-    CO->>AM: POST /dispatch {chunk_id:1, inicio:2.6GB, fin:5.2GB, max_retries:2}
+    AM->>AM: _seleccionar_worker(excluidos={w1, w2}) → w3
+    AM->>CB3: allow_request()?
+    CB3-->>AM: true (CLOSED)
+    AM->>AM: _busy_workers.add(w3)
+    AM->>W3: POST /count {start:0, end:1.7GB}
+    W3-->>AM: {result: {word:count,...}}
+    AM->>CB3: record_success() → fail_count=0
+    AM->>AM: _busy_workers.discard(w3) (finally)
+    AM-->>CO: {chunk_id:0, status:ok, worker_id:w3, result:{...}}
 
-    Note over AM: Intento 1/2
+    Note over CO,W3: Segundo chunk — CB1 y CB2 aún CLOSED (fail_count=1), nuevo dispatch → ya_fallaron = {}
+
+    CO->>AM: POST /dispatch {chunk_id:1, inicio:1.7GB, fin:3.4GB, max_retries:3}
+
+    Note over AM: Intento 1/3
 
     AM->>AM: _seleccionar_worker() → w1 (round-robin)
     AM->>CB1: allow_request()?
     CB1-->>AM: true (CLOSED, fail_count=1)
     AM->>AM: _busy_workers.add(w1)
-    AM->>W1: POST /count {start:2.6GB, end:5.2GB}
+    AM->>W1: POST /count {start:1.7GB, end:3.4GB}
     W1--xAM: Timeout
     AM->>CB1: record_failure() → fail_count=2 ≥ fail_max(2) → OPEN
     AM->>AM: _busy_workers.discard(w1) (finally)
     AM->>AM: ya_fallaron.add(w1)
 
-    Note over AM: Intento 2/2 — ya_fallaron = {w1}
+    Note over AM: Intento 2/3 — ya_fallaron = {w1}
 
     AM->>AM: _seleccionar_worker(excluidos={w1}) → w2
     AM->>CB2: allow_request()?
-    CB2-->>AM: true (CLOSED)
+    CB2-->>AM: true (CLOSED, fail_count=1)
     AM->>AM: _busy_workers.add(w2)
-    AM->>W2: POST /count {start:2.6GB, end:5.2GB}
+    AM->>W2: POST /count {start:1.7GB, end:3.4GB}
     W2-->>AM: {result:{...}}
-    AM->>CB2: record_success()
+    AM->>CB2: record_success() → fail_count=0
     AM->>AM: _busy_workers.discard(w2) (finally)
     AM-->>CO: {chunk_id:1, status:ok, result:{...}}
 
@@ -251,16 +271,20 @@ graph TB
 
         subgraph "Coordinator (coordinator.py :4999)"
             COORD[Flask App]
+            DASH["Dashboard Web<br/>(GET / → dashboard.html<br/>polling /status y /result c/3s)"]
             TP["ThreadPoolExecutor<br/>(despacho paralelo de chunks)"]
-            CT["_total_counter: Counter<br/>(agregación, preservado para /retry-failed)"]
+            PRL["Persistent Retry Loop<br/>(RETRY_DELAY=10s — reintenta<br/>chunks fallidos indefinidamente)"]
+            CT["_total_counter: Counter<br/>(agregación de resultados)"]
             CHT["_chunk_times: dict<br/>(detección de chunks lentos >60s)"]
             HIST["_history: list<br/>(últimas 5 ejecuciones)"]
-            SM["Máquina de estados<br/>idle → running → done|partial|error"]
+            SM["Máquina de estados<br/>idle → running → done|error"]
             GT["Ground Truth<br/>(conteo secuencial opcional)"]
 
+            COORD --> DASH
             COORD --> TP
             COORD --> SM
-            TP --> CT
+            TP --> PRL
+            PRL --> CT
             TP --> CHT
             CT --> HIST
             COORD --> GT
@@ -269,16 +293,18 @@ graph TB
         subgraph "Ambassador (ambassador.py :5005)"
             AM[Flask App<br/>threaded=True]
             RR["Round-Robin Inteligente<br/>(_rr_index + _rr_lock)<br/>salta busy + CB OPEN"]
-            RETRY["Retry Logic<br/>MAX_RETRIES=2 (1 reintento real)<br/>ya_fallaron: set por dispatch"]
+            RETRY["Retry Logic<br/>MAX_RETRIES=3 (2 reintentos reales)<br/>ya_fallaron: set por dispatch"]
             BUSY["_busy_workers: set<br/>(anti-doble-asignación,<br/>marcado en finally)"]
             REGP["Persistencia<br/>_save/_load_registry()<br/>workers_registry.json"]
             HCK["GET /workers/health<br/>(ThreadPoolExecutor paralelo,<br/>timeout 3s por worker)"]
+            AMBH["GET /health<br/>(healthcheck propio<br/>para Docker)"]
 
             AM --> RR
             AM --> RETRY
             RR --> BUSY
             AM --> REGP
             AM --> HCK
+            AM --> AMBH
         end
 
         subgraph "Circuit Breakers (circuit_breaker.py)"
@@ -291,7 +317,8 @@ graph TB
             W1["Worker 1<br/>Host A"]
             W2["Worker 2<br/>Host B"]
             W3["Worker N<br/>Host C"]
-            AR["Auto-registro<br/>register_with_ambassador()<br/>hasta 15 intentos, c/2s"]
+            AR["Auto-registro<br/>_registration_loop(interval=15s)<br/>reintentos indefinidos"]
+            MON["Monitoreo continuo<br/>GET /health al Ambassador c/15s<br/>si falla → re-registro automático"]
             WRD["Lectura por rango<br/>_ajustar_inicio() → alinea a frontera de palabra<br/>read bloques BUFFER_SIZE(64MB)<br/>BOUNDARY_BUF(512B) en límites de chunk"]
         end
 
@@ -303,7 +330,7 @@ graph TB
         end
 
         subgraph "Configuración (config.py)"
-            CFG["AMBASSADOR_PORT=5005<br/>FAIL_MAX=2<br/>RESET_TIMEOUT=10s<br/>MAX_RETRIES=2<br/>REQUEST_TIMEOUT=600s<br/>BUFFER_SIZE=64MB<br/>BOUNDARY_BUF=512B"]
+            CFG["AMBASSADOR_PORT=5005<br/>FAIL_MAX=2<br/>RESET_TIMEOUT=10s<br/>MAX_RETRIES=3<br/>REQUEST_TIMEOUT=600s<br/>BUFFER_SIZE=64MB<br/>BOUNDARY_BUF=512B"]
         end
 
     end
@@ -321,7 +348,8 @@ graph TB
     AM -->|"POST /count {start, end}"| W1
     AM -->|"POST /count {start, end}"| W2
     AM -->|"POST /count {start, end}"| W3
-    AR -.->|"POST /register {worker_id, url}"| AM
+    AR -.->|"POST /register {url}"| AM
+    MON -.->|"GET /health (c/15s)"| AM
     W1 -->|"seek + read bloques 64MB"| F1
     W2 -->|"seek + read bloques 64MB"| F2
     W3 -->|"seek + read bloques 64MB"| F3
@@ -332,7 +360,7 @@ graph TB
 
 ---
 
-## 6. Diagrama de Secuencia — Fallo parcial y retry-failed
+## 6. Diagrama de Secuencia — Reintentos persistentes automáticos (escenario de fallo)
 
 ```mermaid
 sequenceDiagram
@@ -350,15 +378,16 @@ sequenceDiagram
         W1-->>AM: {status:ok, result:{...}}
         AM->>AM: cb_w1.record_success()
         AM-->>CO: {chunk_id:0, status:ok}
-    and Chunk 1 → W2
+    and Chunk 1 → W2 (falla)
         CO->>AM: POST /dispatch {chunk_id:1, inicio:X, fin:Y}
         AM->>W2: POST /count {start:X, end:Y}
         W2--xAM: ConnectionError (worker caído)
         AM->>AM: cb_w2.record_failure()
-        AM->>AM: retry: _seleccionar_worker(excluidos={w2}) → w1
+        Note over AM: Intento 2/3: _seleccionar_worker(excluidos={w2}) → w1
         AM->>W1: POST /count {start:X, end:Y}
         W1--xAM: Timeout (ocupado con chunk 0)
         AM->>AM: cb_w1.record_failure()
+        Note over AM: Intento 3/3: _seleccionar_worker(excluidos={w2,w1}) → None
         AM-->>CO: {chunk_id:1, status:error, reason:max_retries_exceeded}
     and Chunk 2 → W1
         CO->>AM: POST /dispatch {chunk_id:2, inicio:Y, fin:Z}
@@ -368,42 +397,53 @@ sequenceDiagram
         AM-->>CO: {chunk_id:2, status:ok}
     end
 
-    Note over CO: Fase 2 — Auto-reintento automático de chunks fallidos
-    CO->>CO: fallidos_ids = [1] → reintentando con ThreadPoolExecutor
-    CO->>AM: POST /dispatch {chunk_id:1, inicio:X, fin:Y} (reintento automático)
-    AM->>AM: _seleccionar_worker() → w1 (w2 CB puede estar OPEN)
+    Note over CO: _run_processing: chunk_1 falló → pendientes = {chunk_1}
+
+    Note over CO: Persistent Retry Loop — RETRY_DELAY = 10s
+
+    CO->>CO: time.sleep(10) — espera antes de reintentar
+    CO->>CO: intentos[1] = 2
+
+    CO->>AM: POST /dispatch {chunk_id:1, inicio:X, fin:Y}
+    AM->>AM: _seleccionar_worker() → w1 (w2 CB aún CLOSED, fail_count=1)
     AM->>W1: POST /count {start:X, end:Y}
     W1--xAM: Timeout (saturado)
+    AM->>AM: cb_w1.record_failure() → fail_count=2 ≥ fail_max → OPEN
     AM-->>CO: {chunk_id:1, status:error}
 
-    Note over CO: Fase 3 — Resultado parcial
-    CO->>CO: exitosos = 2, num_chunks = 3 → estado = "partial"
-    CO->>CO: total_counter.update() solo chunks 0 y 2
-    CO->>CO: _total_counter preservado para fusión futura
-    CO->>CO: chunks_fallidos = [{chunk_id:1, inicio:X, fin:Y, reason:...}]
-    CO->>CO: Guarda en _history
+    CO->>CO: time.sleep(10) — reintento persistente
+    CO->>CO: intentos[1] = 3
 
-    U->>CO: GET /result
-    CO-->>U: {estado: partial, exitosos: 2, num_chunks: 3, chunks_fallidos: [...]}
+    Note over W2: W2 se recupera y se re-registra automáticamente
 
-    Note over U,W2: Más tarde — W2 se recupera y se re-registra
+    W2->>AM: POST /register {url}
+    AM->>AM: CB w2 tenía fail_count=1 (CLOSED) → se mantiene
+    AM-->>W2: 200 OK {worker_id: w2}
 
-    W2->>AM: POST /register {worker_id:w2, url:...}
-    AM->>AM: CB w2 estaba OPEN → crea nuevo CB en CLOSED (re-registro)
-    AM->>AM: _save_registry()
-    AM-->>W2: 200 OK
+    Note over CO: Coordinator reintenta chunk_1 (el loop nunca se detiene)
 
-    U->>CO: POST /retry-failed
-    CO->>CO: Valida estado == "partial", estado → running
-    CO->>CO: Lee chunks_fallidos → [{chunk_id:1, inicio:X, fin:Y}]
     CO->>AM: POST /dispatch {chunk_id:1, inicio:X, fin:Y}
-    AM->>AM: _seleccionar_worker() → w2 (CB CLOSED)
+    Note over AM: CB w1 OPEN — 10s transcurridos → HALF_OPEN
+    AM->>AM: _seleccionar_worker() → w1 (HALF_OPEN, allow_request()=true)
+    AM->>W1: POST /count {start:X, end:Y}
+    W1--xAM: Timeout
+    AM->>AM: cb_w1.record_failure() → HALF_OPEN → OPEN
+    Note over AM: Intento 2/3: _seleccionar_worker(excluidos={w1}) → w2
     AM->>W2: POST /count {start:X, end:Y}
     W2-->>AM: {status:ok, result:{...}}
     AM->>AM: cb_w2.record_success()
-    AM-->>CO: {chunk_id:1, status:ok, result:{...}}
+    AM-->>CO: {chunk_id:1, status:ok, worker_id:w2, result:{...}}
 
-    CO->>CO: _total_counter.update(result chunk_1) → fusión con chunks 0+2
-    CO->>CO: exitosos = 2+1 = 3 == num_chunks → estado = "done"
-    CO-->>U: {status:ok, recuperados:1, aun_fallidos:0, estado:done}
+    Note over CO: Todos los chunks completados — pendientes = {}
+
+    CO->>CO: total_counter.update() con resultados de chunks 0, 1, 2
+    CO->>CO: reintentos_totales = sum(intentos[i] - 1) = 2
+    CO->>CO: estado → "done" (siempre llega a 100%)
+    CO->>CO: Guarda en _history
+
+    Note over CO: Ground truth (si habilitado)
+    CO->>CO: Conteo secuencial → speedup = t_seq / t_dist
+
+    U->>CO: GET /result
+    CO-->>U: {estado: done, exitosos: 3, num_chunks: 3, reintentos_totales: 2, ...}
 ```
