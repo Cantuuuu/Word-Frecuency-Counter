@@ -73,7 +73,7 @@ Opcionalmente, tras el procesamiento distribuido, el Coordinator ejecuta un cont
 
 ---
 
-## 3. Resultados de la Optimizacion
+## 3. Resultados
 
 ### 3.1 Paralelismo y speedup
 
@@ -98,77 +98,135 @@ El sistema fue diseñado para llegar siempre al 100% de completitud:
 
 ### 3.4 Lectura eficiente de archivos grandes
 
-La lectura en bloques de 64 MB evita cargar chunks de gigabytes en memoria. El ajuste de fronteras de palabra (`_ajustar_inicio` + `BOUNDARY_BUF`) garantiza que no se pierdan ni dupliquen palabras en los cortes de chunk, sin necesidad de comunicación entre workers.
+La lectura en bloques de 64 MB evita cargar chunks de gigabytes en memoria. El ajuste de fronteras de palabra (`_ajustar_inicio` + `BOUNDARY_BUF`) garantiza que no se pierdan ni dupliquen palabras en los cortes de chunk, sin necesidad de comunicación entre workers. Además, cada bloque de 64 MB arrastra (carry-over) el fragmento de palabra que quede al final hacia el siguiente bloque, evitando partir palabras también en las fronteras internas de lectura. Gracias a esto el conteo distribuido es idéntico, palabra por palabra, al ground truth secuencial.
+
+### 3.5 Tabla de resultados: secuencial vs. distribuido
+
+Cada experimento se ejecutó con el mismo archivo en todos los nodos, limitando el corpus lógico al tamaño indicado mediante el parámetro `corpus_gb` del Coordinator (un único archivo sirve para los cinco tamaños). El tiempo distribuido incluye el despacho, el procesamiento en los workers y la combinación de resultados; el tiempo secuencial es el conteo del mismo rango `[0, N GB)` en un solo proceso (ground truth).
+
+> Datos generados con `experimentos/run_experiment.py` → `resultados/experimentos.csv`.
+> Workers utilizados: **_N_** (rellenar). `Speedup = T_secuencial / T_distribuido`.
+
+| Corpus | T. Secuencial (s) | T. Distribuido (s) | Speedup | Correctitud |
+|--------|-------------------|--------------------|---------|-------------|
+| 1 GB   | _pendiente_       | _pendiente_        | _—_     | _✓ / ✗_     |
+| 2 GB   | _pendiente_       | _pendiente_        | _—_     | _✓ / ✗_     |
+| 3 GB   | _pendiente_       | _pendiente_        | _—_     | _✓ / ✗_     |
+| 4 GB   | _pendiente_       | _pendiente_        | _—_     | _✓ / ✗_     |
+| 5 GB   | _pendiente_       | _pendiente_        | _—_     | _✓ / ✗_     |
+
+La columna **Correctitud** es ✓ cuando el Counter distribuido es idéntico al ground truth secuencial: mismo número de palabras únicas y misma frecuencia en cada palabra. El Coordinator hace esta verificación automáticamente al finalizar (campo `correcto` en `/result`).
+
+### 3.6 Gráficas
+
+Generadas con `experimentos/graficar.py` a partir de `resultados/experimentos.csv`:
+
+- **Tiempos secuencial vs. distribuido por tamaño de corpus** — `resultados/tiempos.png`
+- **Speedup por tamaño de corpus** — `resultados/speedup.png`
+
+> _Insertar aquí las dos imágenes una vez generadas:_
+>
+> `![Tiempos secuencial vs distribuido](../resultados/tiempos.png)`
+>
+> `![Speedup por tamaño de corpus](../resultados/speedup.png)`
+
+Lectura esperada: el speedup debe ser **> 1** (el distribuido es más rápido que el secuencial) y crecer o estabilizarse a medida que aumenta el tamaño del corpus, ya que el costo fijo de coordinación se amortiza mejor sobre más datos.
 
 ---
 
-## 4. Decisiones de Diseño
+## 4. Tolerancia a Fallos — Casos de Prueba
 
-### 4.1 Archivo local en cada nodo (no transferencia por red)
+Se ejecutaron los tres escenarios obligatorios induciendo el fallo de uno o más workers a mitad del procesamiento (deteniendo su contenedor o levantándolo con `FAIL_MODE=true`). En todos los casos el sistema debe llegar al **100 % de completitud** sin perder ningún fragmento, y el resultado debe seguir siendo idéntico al ground truth.
+
+> Datos generados con `experimentos/run_fault_test.py` → `resultados/tolerancia_fallos.csv`.
+
+| Caso | Corpus | Workers (inicial → caídos) | T. Distribuido (s) | Reasignaciones (reintentos) | Correctitud vs. GT | Observaciones |
+|------|--------|----------------------------|--------------------|-----------------------------|--------------------|---------------|
+| 1 — 1 worker cae a mitad           | 1 GB | _N_ → 1 | _pendiente_ | _pendiente_ | _✓ / ✗_ | _cómo se redistribuyó la carga_ |
+| 2 — 2 workers caen simultáneamente | 3 GB | _N_ → 2 | _pendiente_ | _pendiente_ | _✓ / ✗_ | _cómo se redistribuyó la carga_ |
+| 3 — 1 worker cae y se recupera     | 1 GB | _N_ → 1 → _N_ | _pendiente_ | _pendiente_ | _✓ / ✗_ | _transición OPEN → HALF_OPEN → CLOSED_ |
+
+### 4.1 Caso 1 — Un worker cae a mitad del corpus de 1 GB
+
+_Describir: en qué momento se detuvo el worker, cómo el Circuit Breaker pasó a OPEN tras `FAIL_MAX` fallos, cómo el Ambassador reasignó el fragmento a otro worker activo y cómo el conteo final coincidió con el ground truth._
+
+### 4.2 Caso 2 — Dos workers caen simultáneamente durante 3 GB
+
+_Describir: caída simultánea de dos workers, redistribución de sus dos fragmentos sobre los workers restantes, tiempo total y verificación de correctitud._
+
+### 4.3 Caso 3 — Un worker cae y se recupera (OPEN → HALF_OPEN → CLOSED)
+
+_Describir: se detuvo un worker (CB → OPEN), luego se volvió a levantar; tras `RESET_TIMEOUT` el CB pasó a HALF_OPEN, la petición de prueba tuvo éxito y volvió a CLOSED, reincorporándose al pool. Documentar la secuencia observada en `GET /workers/status`._
+
+---
+
+## 5. Decisiones de Diseño
+
+### 5.1 Archivo local en cada nodo (no transferencia por red)
 
 El archivo `wiki_es.txt` reside en cada computadora participante. El Coordinator solo envia rangos de bytes (dos enteros) y recibe diccionarios de frecuencia (JSON de kilobytes). La alternativa sería que un nodo central sirviera el archivo por red, pero transferir 5.2 GB por WiFi a cada worker sería el cuello de botella. Con copias locales, el unico factor limitante es la velocidad de disco de cada nodo. 
 
 Probar con nuevos archivos es tan simple como colocar el nuevo archivo en cada nodo y ajustar el nombre en el código, sin necesidad de cambios en la logica de red o procesamiento.
 
-### 4.2 Bind mount en vez de COPY en Docker
+### 5.2 Bind mount en vez de COPY en Docker
 
 El archivo no se incluye en la imagen Docker (`COPY` lo haría parte de la imagen de ~5.3 GB). En su lugar, se monta como volumen de solo lectura (`-v wiki_es.txt:/app/data/input.txt:ro`). Esto mantiene las imágenes ligeras (~150 MB) y permite cambiar el archivo sin reconstruir la imagen.
 
-### 4.3 Ambassador como punto unico de contacto
+### 5.3 Ambassador como punto unico de contacto
 
 El Coordinator no conoce la existencia de workers individuales. Solo se comunica con el Ambassador via tres endpoints: `POST /dispatch`, `GET /workers/status` y `GET /workers/health`. Toda la logica de selección, reintentos, Circuit Breakers y registro vive en el Ambassador. Esto permite que el Coordinator se mantenga simple (orquestación pura) y que la política de balanceo/resiliencia sea modificable sin tocar el Coordinator.
 
-### 4.4 IDs asignados por el Ambassador (no por el worker)
+### 5.4 IDs asignados por el Ambassador (no por el worker)
 
 El Ambassador asigna `worker_01`, `worker_02`, etc. de forma autoincremental al registrarse. Si el worker enviara su propio ID, habría riesgo de colisiones o inconsistencias. Con una asignación centralizada, el Ambassador garantiza individualidad y puede detectar re-registros por URL.
 
-### 4.5 Flask threaded=True en el Ambassador
+### 5.5 Flask threaded=True en el Ambassador
 
 El Ambassador corre con `threaded=True` para atender multiples dispatches concurrentes. Sin esto, los chunks se encolarían y el despacho paralelo del Coordinator sería secuencial en la práctica. Los Circuit Breakers usan `threading.RLock` para proteger su estado ante accesos concurrentes.
 
-### 4.6 Puerto 5005 para el Ambassador
+### 5.6 Puerto 5005 para el Ambassador
 
 Se evitó el puerto 5000 porque macOS lo ocupa con AirPlay Receiver, lo que causaria conflictos en equipos Apple del equipo de trabajo. Pero esto no limitó la flexibilidad de trabajar con cualquier puerto disponible, así como cualquier sistema operativo, personalmente probamos Windows como host del Ambassador y Coordinator y Workers tanto en Windows, MacOS y Linux, trabajando sin problemas.
 
-### 4.7 Timeout de 600 segundos
+### 5.7 Timeout de 600 segundos
 
 El procesamiento de un chunk de ~1.7 GB (con 3 workers) sobre disco local en Docker puede tomar varios minutos. Un timeout demasiado corto causaría falsos positivos en el Circuit Breaker, siendo este un problema que enfrentamos, 600 segundos (10 minutos) da margen suficiente para discos lentos o sistemas con alta carga de virtualización.
 
-### 4.8 RETRY_DELAY de 10 segundos en el Coordinator
+### 5.8 RETRY_DELAY de 10 segundos en el Coordinator
 
 El Coordinator espera 10 segundos entre reintentos persistentes. Un valor más bajo saturaría al Ambassador con peticiones que probablemente siguen fallando. Un valor más alto retrasaría la recuperación cuando un worker vuelve. 10 segundos es un compromiso que permite al worker completar su re-registro (que ocurre cada 15 segundos) antes del siguiente intento.
 
-### 4.9 Persistencia del registro de workers
+### 5.9 Persistencia del registro de workers
 
 El Ambassador guarda el registro en `workers_registry.json`. Si el Ambassador se reinicia, recupera la lista de workers sin esperar que cada uno se re-registre. Los CBs se crean en CLOSED al cargar, y si un worker ya no esta disponible, el CB lo detectara en el primer fallo.
 
 ---
 
-## 5. Puntos de Mejora
+## 6. Puntos de Mejora
 
-### 5.1 Chunks estáticos: un chunk por worker
+### 6.1 Chunks estáticos: un chunk por worker
 
 Actualmente `num_chunks = len(workers)`, asignando exactamente un chunk por worker. Si un worker tiene disco más rapido que otro, terminara antes y quedara ocioso mientras el lento continúa. Una mejora sería dividir en más chunks que workers (por ejemplo, `4 * N`) y asignarlos bajo demanda: cuando un worker termina un chunk, recibe el siguiente pendiente. Esto lograria un mejor balanceo de carga dinámico, adaptándose a las diferencias de rendimiento entre nodos.
 
-### 5.2 Punto unico de fallo: el Ambassador
+### 6.2 Punto unico de fallo: el Ambassador
 
 Si el Ambassador se cae, todo el sistema se detiene. Los workers no pueden registrarse y el Coordinator no puede despachar. Una mejora sería tener multiples instancias del Ambassador detrás de un, load balancer, o que el Coordinator pueda comunicarse directamente con workers como fallback.
 
-### 5.3 Transferencia de resultados grandes
+### 6.3 Transferencia de resultados grandes
 
 Cada worker retorna un diccionario completo `{palabra: conteo}` como JSON. Con un vocabulario de millones de palabras únicas, estos diccionarios pueden pesar decenas de megabytes. Una mejora sería que cada worker retorne solo las top-N palabras, o comprimir el JSON con gzip, o usar un formato binario más eficiente.
 
-### 5.4 Sin autenticación entre servicios
+### 6.4 Sin autenticación entre servicios
 
 Cualquier máquina en la misma red puede registrarse como worker o enviar dispatches al Ambassador. En un entorno de producción, se necesitarían tokens de autenticación o mTLS entre los servicios.
 
-### 5.5 Historial en memoria
+### 6.5 Historial en memoria
 
 El historial de ejecuciones (`_history`, máximo 5 entradas) se pierde al reiniciar el Coordinator. Una mejora sería persistirlo en disco, similar a como el Ambassador persiste el registro de workers.
 
 ---
 
-## 6. Conclusion
+## 7. Conclusion
 
 ### El rol del Ambassador
 

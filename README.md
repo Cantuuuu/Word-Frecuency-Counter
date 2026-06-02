@@ -128,6 +128,27 @@ docker run --rm \
 
 Los workers se auto-registran con el Ambassador. No se necesita configurar IPs manualmente en tu PC.
 
+#### Varios workers en una misma máquina
+
+Cada worker es un contenedor independiente. Para levantar N workers en una sola laptop,
+corre N veces `docker run` cambiando el **puerto de host** y el **WORKER_URL** (el puerto
+interno del contenedor siempre es 5001). El Ambassador les asigna IDs distintos
+(`worker_01`, `worker_02`, ...) por URL. Ejemplo de 3 workers en una Linux con IP `<IP_LAPTOP>`:
+
+```bash
+for p in 5002 5003 5004; do
+  docker run -d --rm \
+    -p $p:5001 \
+    -e AMBASSADOR_URL=http://<IP_TU_PC>:5005 \
+    -e WORKER_URL=http://<IP_LAPTOP>:$p \
+    -v <RUTA_ARCHIVO>:/app/data/input.txt:ro \
+    --name worker_$p \
+    wordcounter-worker
+done
+```
+
+El número de chunks lo decide el Coordinator automáticamente: `num_chunks = workers sanos`.
+
 ### Paso 3: Verificar conexion
 
 ```bash
@@ -150,9 +171,18 @@ curl -X POST http://localhost:4999/start
 curl -X POST http://localhost:4999/start \
   -H "Content-Type: application/json" \
   -d '{"ground_truth": false}'
+
+# Procesar solo los primeros N GB del archivo (control de tamano centralizado:
+# un unico archivo sirve para experimentar con 1, 2, 3, 4, 5 GB)
+curl -X POST http://localhost:4999/start \
+  -H "Content-Type: application/json" \
+  -d '{"corpus_gb": 1}'
 ```
 
 O usar el dashboard en `http://localhost:4999`.
+
+> Para correr los experimentos de rendimiento (1-5 GB) y los casos de fallo y
+> guardarlos en CSV, ver `experimentos/README.md`.
 
 ---
 

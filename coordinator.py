@@ -4,7 +4,8 @@ coordinator.py — Servidor Flask que espera la orden manual de inicio.
 Endpoints:
   GET  /status       → workers, estado actual y chunks lentos en curso
   GET  /result       → resultado del último procesamiento e historial
-  POST /start        → arranca el procesamiento (acepta {"retries": N, "ground_truth": bool})
+  POST /start        → arranca el procesamiento
+                       (acepta {"retries": N, "ground_truth": bool, "corpus_gb": X})
   POST /reset        → vuelve a idle desde done/partial/error (preserva historial)
   POST /retry-failed → re-despacha solo los chunks que fallaron en la última corrida
 
@@ -103,16 +104,83 @@ def _get_workers_listos() -> list[str]:
 # Dividir archivo en chunks de byte-range iguales
 # ---------------------------------------------------------------------------
 
-def _calcular_chunks(file_path: str, n: int) -> list[tuple[int, int]]:
-    total  = os.path.getsize(file_path)
+def _calcular_chunks(file_path: str, n: int, max_bytes: int | None = None) -> list[tuple[int, int]]:
+    """
+    Divide [0, total) en n rangos de bytes contiguos de tamaño parejo.
+
+    Si se pasa max_bytes, el corpus lógico se limita a min(tamaño_real, max_bytes),
+    de modo que un único archivo grande sirve para experimentar con distintos
+    tamaños (1, 2, 3, 4, 5 GB) sin generar archivos separados. Los workers solo
+    leen los rangos indicados; el resto del archivo se ignora.
+    """
+    total = os.path.getsize(file_path)
+    if max_bytes is not None:
+        total = min(total, max_bytes)
+
     size   = total // n
     chunks = []
     for i in range(n):
         start = i * size
         end   = start + size if i < n - 1 else total
         chunks.append((start, end))
-    logger.info(f"Archivo: {total:,} bytes → {n} chunks de ~{size:,} bytes c/u")
+    logger.info(f"Corpus lógico: {total:,} bytes → {n} chunks de ~{size:,} bytes c/u")
     return chunks
+
+
+def _fin_palabra_parcial(texto: str) -> int:
+    """Índice donde empieza la palabra parcial al final de 'texto' (o len si no aplica)."""
+    i = len(texto)
+    while i > 0 and (texto[i - 1].isalnum() or texto[i - 1] == "_"):
+        i -= 1
+    return i
+
+
+def _contar_secuencial(file_path: str, end_byte: int) -> Counter:
+    """
+    Conteo secuencial (ground truth) del rango [0, end_byte).
+
+    Replica EXACTAMENTE la lógica de worker.count_words_from_file con start=0:
+    lectura en bloques de BUFFER_SIZE, carry-over del fragmento final de cada
+    bloque y extensión del último bloque hasta el siguiente espacio. Al usar la
+    misma tokenización que los workers, el resultado secuencial es idéntico a la
+    unión de los chunks distribuidos cuando no se pierde ningún fragmento — esa
+    es justamente la condición de correctitud que verificamos.
+
+    NOTA: mantener idéntica a worker.count_words_from_file. Si cambia una, cambia
+    la otra.
+    """
+    counter = Counter()
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+        remaining = end_byte
+        carry     = ""
+        while remaining > 0:
+            to_read = min(config.BUFFER_SIZE, remaining)
+            block   = file.read(to_read)
+            if not block:
+                break
+            remaining -= len(block.encode("utf-8", errors="ignore"))
+            block = carry + block
+
+            if remaining <= 0:
+                extra = file.read(config.BOUNDARY_BUF)
+                corte = len(extra)
+                for i, ch in enumerate(extra):
+                    if ch in " \t\n\r":
+                        corte = i
+                        break
+                block += extra[:corte]
+                carry  = ""
+            else:
+                pos   = _fin_palabra_parcial(block)
+                carry = block[pos:]
+                block = block[:pos]
+
+            counter.update(re.findall(r"\b\w+\b", block.lower()))
+
+        if carry:
+            counter.update(re.findall(r"\b\w+\b", carry.lower()))
+
+    return counter
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +230,14 @@ def _run_processing(
     num_chunks: int,
     max_retries: int | None = None,
     ground_truth: bool = True,
+    max_bytes: int | None = None,
 ) -> None:
     global _state, _result, _total_counter
 
     try:
-        chunks   = _calcular_chunks(FILE_PATH, num_chunks)
-        t_inicio = time.monotonic()
+        chunks       = _calcular_chunks(FILE_PATH, num_chunks, max_bytes)
+        total_logico = chunks[-1][1]   # Bytes realmente procesados (respeta max_bytes)
+        t_inicio     = time.monotonic()
         resultados: dict[int, dict] = {}
 
         RETRY_DELAY = 10  # Segundos de espera antes de reintentar un chunk fallido
@@ -216,6 +286,8 @@ def _run_processing(
         for cid, resp in resultados.items():
             total_counter.update(resp.get("result", {}))
 
+        total_palabras_dist = sum(total_counter.values())
+
         estado_final = "done"
         reintentos_totales = sum(v - 1 for v in intentos.values())
 
@@ -230,15 +302,48 @@ def _run_processing(
             logger.info(f"  {palabra:<20} {cnt:>10,}")
 
         # --- Ground truth secuencial (opcional) ---
-        t_seq = None
+        t_seq               = None
+        correcto            = None   # None = no se verificó (ground_truth=false)
+        total_palabras_seq  = None
+        palabras_unicas_seq = None
         if ground_truth:
             logger.info("Iniciando conteo secuencial (ground truth) ...")
             t0          = time.monotonic()
-            seq_counter: Counter = Counter()
-            with open(FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    seq_counter.update(re.findall(r"\b\w+\b", line.lower()))
-            t_seq = time.monotonic() - t0
+            seq_counter = _contar_secuencial(FILE_PATH, total_logico)
+            t_seq       = time.monotonic() - t0
+
+            total_palabras_seq  = sum(seq_counter.values())
+            palabras_unicas_seq = len(seq_counter)
+
+            # --- Verificación de correctitud contra el ground truth ---
+            # El sistema distribuido es correcto si y solo si su Counter es
+            # idéntico al secuencial: mismas palabras únicas Y misma frecuencia
+            # en cada una. La comparación de Counter cubre ambas condiciones.
+            correcto = (total_counter == seq_counter)
+
+            logger.info("=" * 60)
+            if correcto:
+                logger.info("Correctitud        : ✓ IDÉNTICO al ground truth")
+            else:
+                logger.warning("Correctitud        : ✗ DIFIERE del ground truth")
+                logger.warning(
+                    f"  Palabras únicas dist/seq : "
+                    f"{len(total_counter):,} / {palabras_unicas_seq:,}"
+                )
+                logger.warning(
+                    f"  Total palabras  dist/seq : "
+                    f"{total_palabras_dist:,} / {total_palabras_seq:,}"
+                )
+                # Mostrar hasta 10 palabras con conteo distinto para diagnosticar
+                difs = []
+                for palabra in set(total_counter) | set(seq_counter):
+                    d, s = total_counter[palabra], seq_counter[palabra]
+                    if d != s:
+                        difs.append((palabra, d, s))
+                        if len(difs) >= 10:
+                            break
+                for palabra, d, s in difs:
+                    logger.warning(f"    {palabra:<20} dist={d:>12,}  seq={s:>12,}")
 
             logger.info("=" * 60)
             logger.info(f"Tiempo secuencial  : {t_seq:.2f}s")
@@ -247,17 +352,22 @@ def _run_processing(
             else:
                 logger.info(f"Speedup: {t_dist / t_seq:.2f}x más lento")
         else:
-            logger.info("Ground truth omitido (ground_truth=false)")
+            logger.info("Ground truth omitido (ground_truth=false) — correctitud no verificada")
 
         nuevo_resultado = {
-            "exitosos":           num_chunks,
-            "num_chunks":         num_chunks,
-            "reintentos_totales": reintentos_totales,
-            "tiempo_distribuido": round(t_dist, 2),
-            "tiempo_secuencial":  round(t_seq, 2) if t_seq is not None else None,
-            "speedup":            round(t_seq / t_dist, 2) if t_seq and t_dist > 0 else None,
-            "palabras_unicas":    len(total_counter),
-            "top20":              total_counter.most_common(20),
+            "exitosos":                    num_chunks,
+            "num_chunks":                  num_chunks,
+            "reintentos_totales":          reintentos_totales,
+            "tiempo_distribuido":          round(t_dist, 2),
+            "tiempo_secuencial":           round(t_seq, 2) if t_seq is not None else None,
+            "speedup":                     round(t_seq / t_dist, 2) if t_seq and t_dist > 0 else None,
+            "correcto":                    correcto,
+            "palabras_unicas":             len(total_counter),
+            "palabras_unicas_secuencial":  palabras_unicas_seq,
+            "total_palabras_distribuido":  total_palabras_dist,
+            "total_palabras_secuencial":   total_palabras_seq,
+            "archivo_bytes":               total_logico,
+            "top20":                       total_counter.most_common(20),
         }
 
         with _lock:
@@ -380,14 +490,29 @@ def start():
     la lista completa de workers registrados como fallback.
 
     Body opcional (JSON):
-        retries      (int):  Reintentos máximos por chunk en el Ambassador.
-        ground_truth (bool): Si false, omite el conteo secuencial al final.
+        retries      (int):   Reintentos máximos por chunk en el Ambassador.
+        ground_truth (bool):  Si false, omite el conteo secuencial al final.
+        corpus_gb    (float): Limita el corpus a procesar a estos GB (1, 2, 3...).
+                              Útil para experimentar con distintos tamaños usando
+                              un único archivo. Tiene prioridad sobre max_bytes.
+        max_bytes    (int):   Límite del corpus en bytes (alternativa a corpus_gb).
+                              Si se omiten ambos, se procesa el archivo completo.
     """
     global _state
 
     body         = request.get_json(silent=True) or {}
     max_retries  = body.get("retries")
     ground_truth = body.get("ground_truth", True)
+
+    # Tamaño de corpus a procesar (corpus_gb tiene prioridad sobre max_bytes)
+    corpus_gb = body.get("corpus_gb")
+    max_bytes = body.get("max_bytes")
+    if corpus_gb is not None:
+        max_bytes = int(float(corpus_gb) * 1024 ** 3)
+    if max_bytes is not None:
+        max_bytes = int(max_bytes)
+        if max_bytes <= 0:
+            return jsonify({"status": "error", "reason": "corpus_gb/max_bytes debe ser > 0"}), 400
 
     with _lock:
         if _state == "running":
@@ -444,10 +569,19 @@ def start():
         logger.info(f"Reintentos configurados: {max_retries}")
     if not ground_truth:
         logger.info("Ground truth desactivado para esta corrida")
+    if max_bytes is not None:
+        if max_bytes < num_chunks:
+            with _lock:
+                _state = "idle"
+            return jsonify({
+                "status": "error",
+                "reason": f"corpus demasiado pequeño ({max_bytes} bytes) para {num_chunks} workers",
+            }), 400
+        logger.info(f"Corpus limitado a: {max_bytes:,} bytes (~{max_bytes / 1024**3:.2f} GB)")
 
     threading.Thread(
         target=_run_processing,
-        args=(num_chunks, max_retries, ground_truth),
+        args=(num_chunks, max_retries, ground_truth, max_bytes),
         daemon=True,
     ).start()
 
@@ -458,6 +592,7 @@ def start():
         "num_chunks":         num_chunks,
         "max_retries":        max_retries,
         "ground_truth":       ground_truth,
+        "max_bytes":          max_bytes,
     })
 
 

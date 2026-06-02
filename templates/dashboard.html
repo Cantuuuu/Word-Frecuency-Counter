@@ -192,6 +192,10 @@
 <header>
   <h1>Word Frequency Counter <span>— Dashboard</span></h1>
   <div class="actions">
+    <input type="number" id="corpusGb" min="0" step="0.5" placeholder="GB (vacío = todo)"
+           title="Limita el corpus a procesar. Vacío = archivo completo."
+           style="padding:9px 12px; border-radius:var(--radius); border:1px solid rgba(255,255,255,0.15);
+                  background:var(--surface2); color:var(--text); width:160px; font-size:0.85rem;">
     <button class="btn btn-green" id="btnStart" onclick="doStart(true)">Iniciar</button>
     <button class="btn btn-blue"  id="btnStartNoGT" onclick="doStart(false)">Iniciar sin Ground Truth</button>
     <button class="btn btn-red"   id="btnReset" onclick="doReset()">Reset</button>
@@ -257,11 +261,12 @@
             <th>T. Distribuido</th>
             <th>T. Secuencial</th>
             <th>Speedup</th>
+            <th>Correcto</th>
             <th>Palabras</th>
           </tr>
         </thead>
         <tbody id="historyBody">
-          <tr><td colspan="8" style="color:var(--text-dim);">Sin historial.</td></tr>
+          <tr><td colspan="9" style="color:var(--text-dim);">Sin historial.</td></tr>
         </tbody>
       </table>
     </div>
@@ -291,6 +296,11 @@ function fmtTime(s) {
   if (s == null) return '—';
   return s.toFixed(2) + ' s';
 }
+function fmtCorrecto(c) {
+  if (c === true)  return '<span style="color:var(--green);">✓</span>';
+  if (c === false) return '<span style="color:var(--red);">✗</span>';
+  return '<span style="color:var(--text-dim); font-size:0.8rem;">sin GT</span>';
+}
 
 /* ---- Acciones ---- */
 async function doStart(groundTruth) {
@@ -299,6 +309,9 @@ async function doStart(groundTruth) {
   btn.textContent = 'Enviando...';
   try {
     const body = groundTruth ? {} : { ground_truth: false };
+    const gbRaw = $('corpusGb').value;
+    const gb = parseFloat(gbRaw);
+    if (gbRaw !== '' && gb > 0) body.corpus_gb = gb;
     const r = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -306,7 +319,8 @@ async function doStart(groundTruth) {
     });
     const j = await r.json();
     if (r.ok) {
-      toast('Procesamiento iniciado con ' + j.num_chunks + ' worker(s)', true);
+      const corpusMsg = j.max_bytes ? ' (' + (j.max_bytes / 1073741824).toFixed(2) + ' GB)' : '';
+      toast('Procesamiento iniciado con ' + j.num_chunks + ' worker(s)' + corpusMsg, true);
     } else {
       toast('Error: ' + (j.reason || r.statusText), false);
     }
@@ -426,10 +440,12 @@ function renderResult(result, estado) {
 
   let html = '<div class="stat-grid">';
   html += statBox('Exitosos', result.exitosos + ' / ' + result.num_chunks);
+  html += statBox('Corpus', result.archivo_bytes != null ? (result.archivo_bytes / 1073741824).toFixed(2) + ' GB' : '—');
   html += statBox('Reintentos', fmt(result.reintentos_totales));
   html += statBox('T. Distribuido', fmtTime(result.tiempo_distribuido));
   html += statBox('T. Secuencial', result.tiempo_secuencial != null ? fmtTime(result.tiempo_secuencial) : '—');
   html += statBox('Speedup', result.speedup != null ? result.speedup + 'x' : '—');
+  html += statBox('Correctitud', fmtCorrecto(result.correcto));
   html += statBox('Palabras unicas', fmt(result.palabras_unicas));
   html += '</div>';
 
@@ -456,7 +472,7 @@ function statBox(label, value) {
 function renderHistory(historial) {
   const tbody = $('historyBody');
   if (!historial || historial.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-dim);">Sin historial.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-dim);">Sin historial.</td></tr>';
     return;
   }
   // Most recent first
@@ -470,6 +486,7 @@ function renderHistory(historial) {
       '<td>' + fmtTime(h.tiempo_distribuido) + '</td>' +
       '<td>' + (h.tiempo_secuencial != null ? fmtTime(h.tiempo_secuencial) : '—') + '</td>' +
       '<td>' + (h.speedup != null ? h.speedup + 'x' : '—') + '</td>' +
+      '<td>' + fmtCorrecto(h.correcto) + '</td>' +
       '<td>' + fmt(h.palabras_unicas) + '</td>' +
       '</tr>';
   }).join('');

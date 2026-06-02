@@ -100,13 +100,34 @@ def _ajustar_inicio(file, start: int) -> int:
             return file.tell()
 
 
+def _fin_palabra_parcial(texto: str) -> int:
+    """
+    Índice donde empieza la palabra parcial al final de 'texto', o len(texto)
+    si el texto no termina dentro de una palabra.
+
+    Se usa para arrastrar (carry-over) el fragmento final de un bloque al
+    siguiente, evitando partir una palabra en la frontera de BUFFER_SIZE.
+    """
+    i = len(texto)
+    while i > 0 and (texto[i - 1].isalnum() or texto[i - 1] == "_"):
+        i -= 1
+    return i
+
+
 def count_words_from_file(file_path: str, start: int, end: int) -> Counter:
     """
     Lee el rango de bytes [start, end) del archivo y cuenta palabras.
 
     Ajusta el inicio al límite de palabra más cercano y extiende el fin
-    BOUNDARY_BUF bytes para capturar palabras partidas en el corte.
-    Lee en bloques de BUFFER_SIZE para evitar OOM en archivos grandes.
+    BOUNDARY_BUF bytes para capturar la palabra partida en el corte 'end'.
+    Lee en bloques de BUFFER_SIZE para evitar OOM en archivos grandes, y
+    arrastra el fragmento de palabra que quede al final de cada bloque al
+    siguiente, de modo que ninguna palabra se cuente partida en las fronteras
+    internas de los bloques.
+
+    NOTA: esta lógica debe mantenerse idéntica a coordinator._contar_secuencial,
+    que la replica para el ground truth. Si cambia una, cambia la otra, o la
+    verificación de correctitud dejará de cuadrar.
     """
     counter = Counter()
 
@@ -114,25 +135,38 @@ def count_words_from_file(file_path: str, start: int, end: int) -> Counter:
         real_start = _ajustar_inicio(file, start)
         file.seek(real_start)
         remaining = end - real_start
+        carry     = ""   # Fragmento de palabra arrastrado del bloque anterior
 
         while remaining > 0:
             to_read = min(BUFFER_SIZE, remaining)
-            chunk   = file.read(to_read)
-            if not chunk:
+            block   = file.read(to_read)
+            if not block:
                 break
-            remaining -= len(chunk.encode("utf-8", errors="ignore"))
+            remaining -= len(block.encode("utf-8", errors="ignore"))
+            block = carry + block
 
             if remaining <= 0:
+                # Último bloque del rango: extender hasta el siguiente espacio
+                # para no partir la palabra que cruza 'end'.
                 extra = file.read(BOUNDARY_BUF)
+                corte = len(extra)
                 for i, ch in enumerate(extra):
                     if ch in " \t\n\r":
-                        chunk += extra[:i]
+                        corte = i
                         break
-                else:
-                    chunk += extra
+                block += extra[:corte]
+                carry  = ""
+            else:
+                # Bloque intermedio: si termina dentro de una palabra, arrastrar
+                # ese fragmento al siguiente bloque en vez de contarlo partido.
+                pos   = _fin_palabra_parcial(block)
+                carry = block[pos:]
+                block = block[:pos]
 
-            words = re.findall(r"\b\w+\b", chunk.lower())
-            counter.update(words)
+            counter.update(re.findall(r"\b\w+\b", block.lower()))
+
+        if carry:  # EOF inesperado con un fragmento pendiente
+            counter.update(re.findall(r"\b\w+\b", carry.lower()))
 
     return counter
 
