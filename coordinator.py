@@ -7,6 +7,8 @@ Endpoints:
   POST /start        → arranca el procesamiento
                        (acepta {"retries": N, "ground_truth": bool, "corpus_gb": X})
   POST /reset        → vuelve a idle desde done/partial/error (preserva historial)
+  POST /reset-cbs    → resetea los Circuit Breakers (proxy al Ambassador)
+  GET  /export.csv   → descarga el historial de ejecuciones en formato CSV
   POST /retry-failed → re-despacha solo los chunks que fallaron en la última corrida
 
 Estados:
@@ -20,6 +22,8 @@ Variables de entorno:
   AMBASSADOR_URL = "http://localhost:5005"
 """
 
+import csv
+import io
 import logging
 import os
 import re
@@ -30,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from datetime import datetime
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, Response
 
 import config
 
@@ -43,7 +47,7 @@ AMBASSADOR_URL = os.getenv("AMBASSADOR_URL", "http://localhost:5005")
 PORT           = int(os.getenv("PORT", "4999"))
 
 SLOW_THRESHOLD = 60   # Segundos antes de marcar un chunk como "lento" en /status
-MAX_HISTORY    = 5    # Número de ejecuciones guardadas en el historial
+MAX_HISTORY    = 50   # Número de ejecuciones guardadas en el historial (experimentos + fallos)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -231,6 +235,7 @@ def _run_processing(
     max_retries: int | None = None,
     ground_truth: bool = True,
     max_bytes: int | None = None,
+    etiqueta: str = "",
 ) -> None:
     global _state, _result, _total_counter
 
@@ -355,6 +360,7 @@ def _run_processing(
             logger.info("Ground truth omitido (ground_truth=false) — correctitud no verificada")
 
         nuevo_resultado = {
+            "etiqueta":                    etiqueta,
             "exitosos":                    num_chunks,
             "num_chunks":                  num_chunks,
             "reintentos_totales":          reintentos_totales,
@@ -470,6 +476,66 @@ def reset():
     return jsonify({"status": "ok", "estado_anterior": estado_anterior})
 
 
+@app.route("/reset-cbs", methods=["POST"])
+def reset_cbs():
+    """
+    Resetea todos los Circuit Breakers a CLOSED (proxy al Ambassador).
+
+    Permite limpiar el estado de los CB desde el dashboard, sin llamar al
+    Ambassador directamente (que está en otro puerto/origen). Útil entre
+    corridas de tolerancia a fallos para reincorporar workers bloqueados.
+    """
+    try:
+        r = requests.post(f"{AMBASSADOR_URL}/workers/reset-cbs", timeout=10)
+        r.raise_for_status()
+        return jsonify(r.json())
+    except Exception as e:
+        logger.warning(f"No se pudo resetear CBs en el Ambassador: {e}")
+        return jsonify({"status": "error", "reason": str(e)}), 502
+
+
+# Columnas del CSV exportable — mismas que experimentos/run_experiment.py
+_CSV_COLUMNAS = [
+    "timestamp", "etiqueta", "corpus_gb", "archivo_bytes", "n_workers",
+    "t_secuencial_s", "t_distribuido_s", "speedup", "palabras_unicas",
+    "total_palabras_dist", "total_palabras_seq", "correcto", "reintentos",
+]
+
+
+@app.route("/export.csv", methods=["GET"])
+def export_csv():
+    """Descarga el historial completo de ejecuciones en formato CSV."""
+    with _lock:
+        historial = list(_history)
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=_CSV_COLUMNAS)
+    writer.writeheader()
+    for h in historial:
+        archivo_bytes = h.get("archivo_bytes")
+        writer.writerow({
+            "timestamp":           h.get("timestamp"),
+            "etiqueta":            h.get("etiqueta", ""),
+            "corpus_gb":           round(archivo_bytes / 1024 ** 3, 4) if archivo_bytes else None,
+            "archivo_bytes":       archivo_bytes,
+            "n_workers":           h.get("num_chunks"),
+            "t_secuencial_s":      h.get("tiempo_secuencial"),
+            "t_distribuido_s":     h.get("tiempo_distribuido"),
+            "speedup":             h.get("speedup"),
+            "palabras_unicas":     h.get("palabras_unicas"),
+            "total_palabras_dist": h.get("total_palabras_distribuido"),
+            "total_palabras_seq":  h.get("total_palabras_secuencial"),
+            "correcto":            h.get("correcto"),
+            "reintentos":          h.get("reintentos_totales"),
+        })
+
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=experimentos.csv"},
+    )
+
+
 @app.route("/retry-failed", methods=["POST"])
 def retry_failed():
     """Obsoleto — el sistema ahora reintenta indefinidamente hasta completar."""
@@ -503,6 +569,7 @@ def start():
     body         = request.get_json(silent=True) or {}
     max_retries  = body.get("retries")
     ground_truth = body.get("ground_truth", True)
+    etiqueta     = (body.get("etiqueta") or "").strip()
 
     # Tamaño de corpus a procesar (corpus_gb tiene prioridad sobre max_bytes)
     corpus_gb = body.get("corpus_gb")
@@ -581,7 +648,7 @@ def start():
 
     threading.Thread(
         target=_run_processing,
-        args=(num_chunks, max_retries, ground_truth, max_bytes),
+        args=(num_chunks, max_retries, ground_truth, max_bytes, etiqueta),
         daemon=True,
     ).start()
 
@@ -593,6 +660,7 @@ def start():
         "max_retries":        max_retries,
         "ground_truth":       ground_truth,
         "max_bytes":          max_bytes,
+        "etiqueta":           etiqueta,
     })
 
 
@@ -606,5 +674,7 @@ if __name__ == "__main__":
     logger.info(f"  GET  http://localhost:{PORT}/result        → ver resultado e historial")
     logger.info(f'  POST http://localhost:{PORT}/start         → arrancar  [{{"retries": N, "ground_truth": false}}]')
     logger.info(f"  POST http://localhost:{PORT}/reset         → volver a idle")
+    logger.info(f"  POST http://localhost:{PORT}/reset-cbs     → resetear Circuit Breakers (proxy Ambassador)")
+    logger.info(f"  GET  http://localhost:{PORT}/export.csv    → descargar historial en CSV")
     logger.info(f"  POST http://localhost:{PORT}/retry-failed  → (obsoleto, reintentos ahora son automáticos)")
     app.run(host="0.0.0.0", port=PORT)

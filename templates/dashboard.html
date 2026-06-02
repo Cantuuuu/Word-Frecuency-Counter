@@ -192,13 +192,23 @@
 <header>
   <h1>Word Frequency Counter <span>— Dashboard</span></h1>
   <div class="actions">
+    <input type="text" id="etiqueta" placeholder="Etiqueta (ej. 1GB, caso1-fallo)"
+           title="Etiqueta libre para identificar esta corrida en el historial/CSV."
+           style="padding:9px 12px; border-radius:var(--radius); border:1px solid rgba(255,255,255,0.15);
+                  background:var(--surface2); color:var(--text); width:200px; font-size:0.85rem;">
     <input type="number" id="corpusGb" min="0" step="0.5" placeholder="GB (vacío = todo)"
            title="Limita el corpus a procesar. Vacío = archivo completo."
            style="padding:9px 12px; border-radius:var(--radius); border:1px solid rgba(255,255,255,0.15);
-                  background:var(--surface2); color:var(--text); width:160px; font-size:0.85rem;">
+                  background:var(--surface2); color:var(--text); width:150px; font-size:0.85rem;">
+    <input type="number" id="retries" min="1" step="1" placeholder="Reintentos"
+           title="Reintentos por chunk en el Ambassador (vacío = default)."
+           style="padding:9px 12px; border-radius:var(--radius); border:1px solid rgba(255,255,255,0.15);
+                  background:var(--surface2); color:var(--text); width:110px; font-size:0.85rem;">
     <button class="btn btn-green" id="btnStart" onclick="doStart(true)">Iniciar</button>
-    <button class="btn btn-blue"  id="btnStartNoGT" onclick="doStart(false)">Iniciar sin Ground Truth</button>
+    <button class="btn btn-blue"  id="btnStartNoGT" onclick="doStart(false)">Iniciar sin GT</button>
     <button class="btn btn-red"   id="btnReset" onclick="doReset()">Reset</button>
+    <button class="btn btn-red"   id="btnResetCbs" onclick="doResetCbs()" title="Resetear Circuit Breakers a CLOSED">Reset CBs</button>
+    <button class="btn btn-blue"  id="btnExport" onclick="window.location='/export.csv'" title="Descargar historial en CSV">Descargar CSV</button>
   </div>
 </header>
 
@@ -255,8 +265,9 @@
         <thead>
           <tr>
             <th>Fecha</th>
-            <th>Chunks</th>
-            <th>Exitosos</th>
+            <th>Etiqueta</th>
+            <th>Corpus</th>
+            <th>Workers</th>
             <th>Reintentos</th>
             <th>T. Distribuido</th>
             <th>T. Secuencial</th>
@@ -266,7 +277,7 @@
           </tr>
         </thead>
         <tbody id="historyBody">
-          <tr><td colspan="9" style="color:var(--text-dim);">Sin historial.</td></tr>
+          <tr><td colspan="10" style="color:var(--text-dim);">Sin historial.</td></tr>
         </tbody>
       </table>
     </div>
@@ -312,6 +323,11 @@ async function doStart(groundTruth) {
     const gbRaw = $('corpusGb').value;
     const gb = parseFloat(gbRaw);
     if (gbRaw !== '' && gb > 0) body.corpus_gb = gb;
+    const etiqueta = $('etiqueta').value.trim();
+    if (etiqueta) body.etiqueta = etiqueta;
+    const retriesRaw = $('retries').value;
+    const retries = parseInt(retriesRaw, 10);
+    if (retriesRaw !== '' && retries > 0) body.retries = retries;
     const r = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -329,6 +345,25 @@ async function doStart(groundTruth) {
   } finally {
     btn.disabled = false;
     btn.textContent = groundTruth ? 'Iniciar' : 'Iniciar sin Ground Truth';
+  }
+}
+
+async function doResetCbs() {
+  const btn = $('btnResetCbs');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/reset-cbs', { method: 'POST' });
+    const j = await r.json();
+    if (r.ok) {
+      toast('Circuit Breakers reseteados: ' + ((j.reseteados || []).length) + ' worker(s)', true);
+      refresh();
+    } else {
+      toast('Error: ' + (j.reason || r.statusText), false);
+    }
+  } catch (e) {
+    toast('No se pudo conectar al coordinator', false);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -472,16 +507,18 @@ function statBox(label, value) {
 function renderHistory(historial) {
   const tbody = $('historyBody');
   if (!historial || historial.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-dim);">Sin historial.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-dim);">Sin historial.</td></tr>';
     return;
   }
   // Most recent first
   const rows = [...historial].reverse();
   tbody.innerHTML = rows.map(h => {
+    const gb = h.archivo_bytes != null ? (h.archivo_bytes / 1073741824).toFixed(2) + ' GB' : '—';
     return '<tr>' +
       '<td>' + (h.timestamp || '—') + '</td>' +
+      '<td>' + (h.etiqueta || '—') + '</td>' +
+      '<td>' + gb + '</td>' +
       '<td>' + (h.num_chunks ?? '—') + '</td>' +
-      '<td>' + (h.exitosos ?? '—') + '</td>' +
       '<td>' + (h.reintentos_totales ?? '—') + '</td>' +
       '<td>' + fmtTime(h.tiempo_distribuido) + '</td>' +
       '<td>' + (h.tiempo_secuencial != null ? fmtTime(h.tiempo_secuencial) : '—') + '</td>' +
