@@ -540,6 +540,32 @@ def export_csv():
     )
 
 
+@app.route("/palabras.csv", methods=["GET"])
+def export_palabras():
+    """Descarga la lista COMPLETA de palabras del último conteo (palabra,frecuencia).
+
+    Ordenada por frecuencia descendente. Es el conteo combinado de todos los
+    workers (_total_counter), no solo el top 20 que muestra el dashboard.
+    """
+    with _lock:
+        palabras = _total_counter.most_common()  # todas, de mayor a menor
+
+    if not palabras:
+        return jsonify({"status": "error", "reason": "no hay un conteo disponible; corre /start primero"}), 404
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["palabra", "frecuencia"])
+    writer.writerows(palabras)
+
+    # BOM UTF-8 para que Excel en Windows muestre bien los acentos al abrir el CSV.
+    return Response(
+        "﻿" + buffer.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=palabras.csv"},
+    )
+
+
 @app.route("/retry-failed", methods=["POST"])
 def retry_failed():
     """Obsoleto — el sistema ahora reintenta indefinidamente hasta completar."""
