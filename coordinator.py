@@ -131,10 +131,14 @@ def _calcular_chunks(file_path: str, n: int, max_bytes: int | None = None) -> li
     return chunks
 
 
-def _fin_palabra_parcial(texto: str) -> int:
-    """Índice donde empieza la palabra parcial al final de 'texto' (o len si no aplica)."""
-    i = len(texto)
-    while i > 0 and (texto[i - 1].isalnum() or texto[i - 1] == "_"):
+def _fin_palabra_parcial(bloque: bytes) -> int:
+    """Índice tras el último byte de espacio de 'bloque' (o len si no hay ninguno).
+
+    Idéntico a worker._fin_palabra_parcial: opera en bytes y corta en espacios
+    para no partir palabras ni caracteres UTF-8 multibyte al decodificar.
+    """
+    i = len(bloque)
+    while i > 0 and bloque[i - 1] not in b" \t\n\r":
         i -= 1
     return i
 
@@ -144,9 +148,9 @@ def _contar_secuencial(file_path: str, end_byte: int) -> Counter:
     Conteo secuencial (ground truth) del rango [0, end_byte).
 
     Replica EXACTAMENTE la lógica de worker.count_words_from_file con start=0:
-    lectura en bloques de BUFFER_SIZE, carry-over del fragmento final de cada
-    bloque y extensión del último bloque hasta el siguiente espacio. Al usar la
-    misma tokenización que los workers, el resultado secuencial es idéntico a la
+    lectura BINARIA en bloques de BUFFER_SIZE, carry-over del fragmento final de
+    cada bloque y extensión del último bloque hasta el siguiente espacio. Al usar
+    la misma tokenización que los workers, el resultado secuencial es idéntico a la
     unión de los chunks distribuidos cuando no se pierde ningún fragmento — esa
     es justamente la condición de correctitud que verificamos.
 
@@ -154,35 +158,35 @@ def _contar_secuencial(file_path: str, end_byte: int) -> Counter:
     la otra.
     """
     counter = Counter()
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+    with open(file_path, "rb") as file:
         remaining = end_byte
-        carry     = ""
+        carry     = b""
         while remaining > 0:
             to_read = min(config.BUFFER_SIZE, remaining)
             block   = file.read(to_read)
             if not block:
                 break
-            remaining -= len(block.encode("utf-8", errors="ignore"))
+            remaining -= len(block)
             block = carry + block
 
             if remaining <= 0:
                 extra = file.read(config.BOUNDARY_BUF)
                 corte = len(extra)
                 for i, ch in enumerate(extra):
-                    if ch in " \t\n\r":
+                    if ch in b" \t\n\r":
                         corte = i
                         break
                 block += extra[:corte]
-                carry  = ""
+                carry  = b""
             else:
                 pos   = _fin_palabra_parcial(block)
                 carry = block[pos:]
                 block = block[:pos]
 
-            counter.update(re.findall(r"\b\w+\b", block.lower()))
+            counter.update(re.findall(r"\b\w+\b", block.decode("utf-8", errors="ignore").lower()))
 
         if carry:
-            counter.update(re.findall(r"\b\w+\b", carry.lower()))
+            counter.update(re.findall(r"\b\w+\b", carry.decode("utf-8", errors="ignore").lower()))
 
     return counter
 

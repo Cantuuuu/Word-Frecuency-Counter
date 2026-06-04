@@ -90,26 +90,30 @@ def health():
 # ---------------------------------------------------------------------------
 
 def _ajustar_inicio(file, start: int) -> int:
-    """Avanza hasta el primer espacio en blanco tras 'start' para no partir palabras."""
+    """Avanza hasta el primer byte de espacio tras 'start' para no partir palabras.
+
+    Opera en BYTES (archivo abierto en modo binario) para que el offset coincida
+    exactamente con el que calculó el coordinador.
+    """
     if start == 0:
         return 0
     file.seek(start)
     while True:
         ch = file.read(1)
-        if not ch or ch in " \t\n\r":
+        if not ch or ch in b" \t\n\r":
             return file.tell()
 
 
-def _fin_palabra_parcial(texto: str) -> int:
+def _fin_palabra_parcial(bloque: bytes) -> int:
     """
-    Índice donde empieza la palabra parcial al final de 'texto', o len(texto)
-    si el texto no termina dentro de una palabra.
-
-    Se usa para arrastrar (carry-over) el fragmento final de un bloque al
-    siguiente, evitando partir una palabra en la frontera de BUFFER_SIZE.
+    Índice tras el último byte de espacio en blanco de 'bloque' (o len si no hay
+    ninguno). Los bytes posteriores son una palabra sin terminar que se arrastra
+    (carry-over) al siguiente bloque, evitando partir una palabra en la frontera
+    de BUFFER_SIZE. Cortar en un espacio (byte ASCII de un solo octeto) garantiza
+    además que nunca se parte un carácter UTF-8 multibyte al decodificar.
     """
-    i = len(texto)
-    while i > 0 and (texto[i - 1].isalnum() or texto[i - 1] == "_"):
+    i = len(bloque)
+    while i > 0 and bloque[i - 1] not in b" \t\n\r":
         i -= 1
     return i
 
@@ -125,24 +129,30 @@ def count_words_from_file(file_path: str, start: int, end: int) -> Counter:
     siguiente, de modo que ninguna palabra se cuente partida en las fronteras
     internas de los bloques.
 
+    El archivo se abre en modo BINARIO: el coordinador reparte el corpus por
+    offsets de bytes, así que el worker debe leer rangos de bytes exactos. Leer
+    en modo texto contaba caracteres (1 acento UTF-8 = 2 bytes), lo que hacía que
+    cada chunk se pasara de su 'end' e invadiera al siguiente → doble conteo en
+    las fronteras. Se decodifica a texto solo para tokenizar con la regex.
+
     NOTA: esta lógica debe mantenerse idéntica a coordinator._contar_secuencial,
     que la replica para el ground truth. Si cambia una, cambia la otra, o la
     verificación de correctitud dejará de cuadrar.
     """
     counter = Counter()
 
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+    with open(file_path, "rb") as file:
         real_start = _ajustar_inicio(file, start)
         file.seek(real_start)
         remaining = end - real_start
-        carry     = ""   # Fragmento de palabra arrastrado del bloque anterior
+        carry     = b""   # Fragmento de palabra arrastrado del bloque anterior
 
         while remaining > 0:
             to_read = min(BUFFER_SIZE, remaining)
             block   = file.read(to_read)
             if not block:
                 break
-            remaining -= len(block.encode("utf-8", errors="ignore"))
+            remaining -= len(block)
             block = carry + block
 
             if remaining <= 0:
@@ -151,11 +161,11 @@ def count_words_from_file(file_path: str, start: int, end: int) -> Counter:
                 extra = file.read(BOUNDARY_BUF)
                 corte = len(extra)
                 for i, ch in enumerate(extra):
-                    if ch in " \t\n\r":
+                    if ch in b" \t\n\r":
                         corte = i
                         break
                 block += extra[:corte]
-                carry  = ""
+                carry  = b""
             else:
                 # Bloque intermedio: si termina dentro de una palabra, arrastrar
                 # ese fragmento al siguiente bloque en vez de contarlo partido.
@@ -163,10 +173,10 @@ def count_words_from_file(file_path: str, start: int, end: int) -> Counter:
                 carry = block[pos:]
                 block = block[:pos]
 
-            counter.update(re.findall(r"\b\w+\b", block.lower()))
+            counter.update(re.findall(r"\b\w+\b", block.decode("utf-8", errors="ignore").lower()))
 
         if carry:  # EOF inesperado con un fragmento pendiente
-            counter.update(re.findall(r"\b\w+\b", carry.lower()))
+            counter.update(re.findall(r"\b\w+\b", carry.decode("utf-8", errors="ignore").lower()))
 
     return counter
 
